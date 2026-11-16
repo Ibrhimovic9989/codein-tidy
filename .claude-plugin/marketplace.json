@@ -1,0 +1,12 @@
+{
+  "name": "codein-tidy",
+  "description": "Disk tidy by code.in: see and safely free the disk space AI coding tools leave behind.",
+  "owner": { "name": "code.in", "url": "https://code.in" },
+  "plugins": [
+    {
+      "name": "disk-tidy",
+      "source": "./",
+      "description": "See and safely free the disk space AI coding tools leave behind. Uncommitted work is never deleted."
+    }
+  ]
+}

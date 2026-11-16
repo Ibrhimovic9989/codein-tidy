@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "disk-tidy",
+  "version": "0.1.0",
+  "description": "See and safely free the disk space AI coding tools leave behind. Uncommitted work is never deleted."
+}

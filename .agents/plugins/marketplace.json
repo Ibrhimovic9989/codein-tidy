@@ -1,0 +1,12 @@
+{
+  "name": "codein-tidy",
+  "interface": { "displayName": "Disk tidy by code.in" },
+  "plugins": [
+    {
+      "name": "disk-tidy",
+      "source": { "source": "local", "path": "./" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

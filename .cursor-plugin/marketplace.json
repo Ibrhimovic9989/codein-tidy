@@ -1,0 +1,5 @@
+{
+  "name": "codein-tidy",
+  "owner": { "name": "code.in" },
+  "plugins": [{ "name": "disk-tidy", "source": "./" }]
+}

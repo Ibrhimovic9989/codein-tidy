@@ -1,0 +1,16 @@
+{
+  "name": "codein-tidy",
+  "version": "0.1.0",
+  "description": "See and safely free the disk space AI coding tools leave behind: Claude Code, Codex, Cursor, Antigravity.",
+  "type": "module",
+  "bin": { "codein-tidy": "tidy.mjs" },
+  "files": ["tidy.mjs", "skills", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": { "test": "node --test tidy.test.mjs" },
+  "keywords": ["claude-code", "codex", "cursor", "antigravity", "disk-space", "cleanup", "worktrees", "agent-skill"],
+  "homepage": "https://github.com/Ibrhimovic9989/codein-tidy#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/Ibrhimovic9989/codein-tidy.git" },
+  "bugs": "https://github.com/Ibrhimovic9989/codein-tidy/issues",
+  "author": "code.in (https://code.in)",
+  "license": "MIT"
+}
