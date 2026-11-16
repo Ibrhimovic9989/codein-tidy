@@ -50,14 +50,14 @@ they are moved to a trash folder in `~/.codein-tidy/trash`, emptied after 7 days
 
 ## Use it from your agent
 
-The `disk-tidy` skill lets your agent do this for you. Ask "what is using my disk?" and it runs the report,
+The plugin in `plugins/codein-tidy` carries one skill, `disk-tidy`, that lets your agent do this for you. Ask "what is using my disk?" and it runs the report,
 then asks before cleaning. It reviews and commits uncommitted work instead of deleting it.
 
 **Claude Code**
 
 ```
 /plugin marketplace add Ibrhimovic9989/codein-tidy
-/plugin install disk-tidy@codein-tidy
+/plugin install codein-tidy@codein-tidy
 ```
 
 **Codex**
@@ -66,17 +66,14 @@ then asks before cleaning. It reviews and commits uncommitted work instead of de
 codex plugin marketplace add Ibrhimovic9989/codein-tidy
 ```
 
-Then type `/plugins` in Codex and install Disk tidy.
+Then type `/plugins` in Codex and install codein-tidy.
 
 **Cursor:** Customize, then "From GitHub Repository", then `Ibrhimovic9989/codein-tidy`.
 
-**Antigravity**
+**Antigravity:** copy `plugins/codein-tidy/skills/disk-tidy` into `~/.gemini/config/skills/` (a marketplace listing
+is on its way).
 
-```
-agy plugin install https://github.com/Ibrhimovic9989/codein-tidy
-```
-
-**Any agent that reads skills:** copy `skills/disk-tidy` into its skills folder (for example
+**Any agent that reads skills:** copy `plugins/codein-tidy/skills/disk-tidy` into its skills folder (for example
 `~/.agents/skills/`, `~/.claude/skills/` or `~/.cursor/skills/`).
 
 ## Commands

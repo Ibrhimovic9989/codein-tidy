@@ -1,10 +1,16 @@
 {
-  "name": "disk-tidy",
+  "name": "codein-tidy",
   "description": "See and safely free the disk space AI coding tools leave behind. Uncommitted work is never deleted.",
   "version": "0.1.0",
-  "author": { "name": "code.in" },
+  "author": {
+    "name": "code.in"
+  },
   "repository": "https://github.com/Ibrhimovic9989/codein-tidy",
   "license": "MIT",
-  "keywords": ["disk-space", "cleanup", "worktrees"],
+  "keywords": [
+    "disk-space",
+    "cleanup",
+    "worktrees"
+  ],
   "logo": "assets/logo.svg"
 }
