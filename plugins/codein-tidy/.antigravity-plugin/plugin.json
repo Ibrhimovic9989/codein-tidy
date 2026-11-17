@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "codein-tidy",
   "displayName": "Disk tidy by code.in",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "See and safely free the disk space AI coding tools leave behind. Uncommitted work is never deleted.",
   "logo": "assets/logo.svg",
   "author": "code.in",

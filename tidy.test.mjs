@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -915,6 +915,98 @@ test('guided: one command scans, shows a review list, takes a selection and one 
   const no = await run(['', 'n']);
   assert.equal(no.result.done, false);
   assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old2.sh')), true);
+});
+
+test('guided: plain words work at the prompt (the answers a person really typed)', async () => {
+  // Typed by the founder on 0.4.0, where every word was read as item numbers and silently ignored.
+  for (const t of ['', 'go', 'Go on with the selected items', 'yes', 'ok', 'continue', 'go ahead.']) assert.equal(readAnswer(t).action, 'go', t);
+  for (const t of ['a', 'all', 'All', 'select all']) assert.equal(readAnswer(t).action, 'all', t);
+  for (const t of ['n', 'none', 'clear']) assert.equal(readAnswer(t).action, 'none', t);
+  for (const t of ['q', 'quit', 'exit', 'cancel']) assert.equal(readAnswer(t).action, 'quit', t);
+  assert.deepEqual(readAnswer('2 3 4 5 6 7'), { action: 'switch', numbers: [2, 3, 4, 5, 6, 7] });
+  assert.deepEqual(readAnswer('1,7'), { action: 'switch', numbers: [1, 7] });
+  assert.deepEqual(readAnswer('details 2'), { action: 'detail', n: 2 });
+  assert.equal(readAnswer('yes 2').action, 'unknown', 'a number never counts as go');
+  assert.equal(readAnswer('banana').action, 'unknown');
+
+  const m = await machine();
+  const { repo } = await project(m);
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old.sh'), 10);
+  await aged(join(m.home, '.codex', 'archived_sessions', 'old.jsonl'), 90);
+  const { PassThrough } = await import('node:stream');
+  const run = async (answers) => {
+    const input = new PassThrough(), output = new PassThrough(); let text = '';
+    output.on('data', (d) => { text += d; });
+    const done = guidedRun({ input, output, options: { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY } });
+    for (const a of answers) input.write(a + '\r\n');
+    input.end();
+    return { result: await done, text };
+  };
+
+  // Not understood: said so, nothing changed. An empty yes/no answer asks again instead of giving up.
+  const unclear = await run(['banana', '', '', 'n']);
+  assert.equal(unclear.result.done, false);
+  assert.match(unclear.text, /Not sure what "banana" means/);
+  assert.match(unclear.text, /Type y or n\./);
+  assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old.sh')), true);
+
+  // The founder's words: select all, then go on, then yes. Everything selected is freed, history included.
+  const words = await run(['all', 'go on with the selected items', 'yes']);
+  assert.equal(words.result.done, true, words.text);
+  assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old.sh')), false);
+  assert.equal(await exists(join(m.home, '.codex', 'archived_sessions', 'old.jsonl')), false);
+});
+
+test('guided in a terminal: arrow keys and space pick, Enter confirms, live progress while it works', async () => {
+  const m = await machine();
+  const { repo } = await project(m);
+  const snap = join(m.home, '.claude', 'shell-snapshots', 'old.sh'), chat = join(m.home, '.codex', 'archived_sessions', 'old.jsonl');
+  await aged(snap, 10);
+  await aged(chat, 90);
+  const { PassThrough } = await import('node:stream');
+  const UP = '\x1b[A', DOWN = '\x1b[B', RIGHT = '\x1b[C', ENTER = '\r', SPACE = ' ';
+  const run = async (keys) => {
+    const input = new PassThrough(), output = new PassThrough(); let text = '';
+    input.isTTY = true; input.setRawMode = () => input;
+    output.isTTY = true; output.columns = 140; output.rows = 40;
+    output.on('data', (d) => { text += d; });
+    const done = guidedRun({ input, output, options: { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY } });
+    for (const k of keys) input.write(k);
+    input.end();
+    const result = await done;
+    return { result, text, plain: text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '') };
+  };
+
+  // Look, open details, quit: nothing changes. The scan showed a live line; the list has sizes and the key help.
+  const look = await run([DOWN, UP, RIGHT, 'q']);
+  assert.equal(look.result.done, false);
+  assert.match(look.plain, /Looking at what AI coding tools left|Measuring what AI coding tools keep/);
+  assert.match(look.plain, /> \[x\] +\d/, 'the cursor sits on a selected item');
+  assert.match(look.plain, /\[ \] .*Old chat history/);
+  assert.match(look.plain, /Up\/Down move +Space select +A all +Right details +Enter continue +Q quit/);
+  assert.match(look.plain, /Nothing was changed/);
+  assert.equal(await exists(snap), true);
+
+  // Nothing selected and Enter: it says so instead of going on. Then Q.
+  const none = await run(['n', ENTER, 'q']);
+  assert.match(none.plain, /Nothing is selected\. Press Space on an item, or A for all\./);
+  assert.equal(none.result.done, false);
+
+  // Enter, then "No: back to the list" (down, Enter), then Q: nothing changes.
+  const back = await run([ENTER, DOWN, ENTER, 'q']);
+  assert.match(back.plain, /Yes: free about/);
+  assert.equal(back.result.done, false);
+  assert.equal(await exists(snap), true);
+
+  // Space on the last item (history) by going up from the top, Enter, Enter on Yes: both are freed, with a bar.
+  const go = await run([UP, SPACE, ENTER, ENTER]);
+  assert.equal(go.result.done, true, go.plain);
+  assert.match(go.plain, /Old chat history will be deleted for good/);
+  assert.match(go.plain, /Freeing caches, logs and leftovers/);
+  assert.match(go.plain, /✓ Freed caches, logs and leftovers/);
+  assert.match(go.plain, /Done\. About .* freed\./);
+  assert.equal(await exists(snap), false);
+  assert.equal(await exists(chat), false);
 });
 
 test('guided for an agent: the bare command lists named items and how to apply; --apply does only what was named', async () => {

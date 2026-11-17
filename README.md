@@ -9,10 +9,11 @@ Works with **Claude Code, Codex, Cursor and Antigravity** on Windows, macOS and 
 npx codein-tidy            # one command: review everything, choose, confirm once, done
 ```
 
-In a terminal it scans everything, shows one list (each item with its size and what will happen), lets you keep
-the suggested selection, select all, or switch items by number, asks yes or no once, then does it: every idle
-worktree's work is saved into one file per project before the folder is removed, then caches, logs and leftovers
-are freed. Through an agent (no terminal) the same list is printed with a name per item; the agent shows it to
+In a terminal it scans everything with a live progress bar, then shows one list: each item with its size and
+what will happen. Move with the arrow keys, Space selects, A selects all, Right shows the folders or files behind
+an item, Enter continues. You confirm once (Yes, back to the list, or quit), then it does it with a live bar:
+every idle worktree's work is saved into one file per project before the folder is removed, then caches, logs and
+leftovers are freed. Through an agent (no terminal) the same list is printed with a name per item; the agent shows it to
 you and runs your choice with `npx codein-tidy --apply=<names>` (or `--apply=suggested`, `--apply=all`).
 
 ```

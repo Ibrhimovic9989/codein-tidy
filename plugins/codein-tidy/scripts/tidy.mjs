@@ -760,7 +760,7 @@ export async function scan(options = {}) {
   // An agent reads this through a pipe, where the live progress line never shows: say once that work is under way.
   if (!process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`codein-tidy: measuring ${all.length} places...\n`);
   let finished = 0;
-  const progress = () => { if (process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`\x1b[2KMeasuring ${all.length} places: ${finished} done...\r`); };
+  const progress = () => { if (options.onStatus) return options.onStatus({ label: 'Measuring what AI coding tools keep', done: finished, total: all.length }); if (process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`\x1b[2KMeasuring ${all.length} places: ${finished} done...\r`); };
   progress();
   // Places are independent, so they are measured at the same time; the report keeps their order.
   const plans = await Promise.all(all.map(async (target) => {
@@ -770,19 +770,22 @@ export async function scan(options = {}) {
     if (process.env.CODEIN_TIDY_PROFILE) console.error(`${String(Date.now() - started).padStart(7)} ms  ${target.tool}: ${target.item}`);
     return result;
   }));
-  if (process.stderr.isTTY) process.stderr.write('\x1b[2K');
+  if (process.stderr.isTTY && !options.onStatus) process.stderr.write('\x1b[2K');
   if (options.project) plans.push(...await projectPlans(options.project, opts));
   for (const p of plans) p.home = options.home; // where saved work goes (tests pass their own home)
   return plans;
 }
 
-export async function clean(plans, now = Date.now(), { runner = runCacheCommand } = {}) {
+export async function clean(plans, now = Date.now(), { runner = runCacheCommand, onStep } = {}) {
   const receipt = { removed: 0, bytes: 0, moved: 0, movedBytes: 0, trash: undefined, failed: [] };
   const stamp = new Date(now).toISOString().replace(/[:.]/g, '-');
+  const total = plans.filter((t) => !t.skipped).reduce((n, t) => n + t.removable.length, 0);
+  let done = 0;
   for (const target of plans) {
     if (target.skipped) continue;
     if (target.kind === 'trash') await emptyOldTrash(target.trashDir, now);
     for (const entry of target.removable) {
+      onStep?.({ done: done++, total, note: `${target.tool}: ${target.item}` });
       try {
         if (target.kind === 'trash') {
           if (!inside(target.path, entry.path)) throw new Error('outside the project');
@@ -1037,7 +1040,9 @@ async function closeLeftovers(options = {}) {
 export async function closeFolders(plan, options = {}) {
   const receipt = { closed: [], failed: [], saved: [], bundles: [], freed: 0 };
   const byProject = new Map();
+  let done = 0;
   for (const x of plan.candidates) {
+    options.onStep?.({ done: done++, total: plan.candidates.length, note: x.path });
     try {
       if (x.leftover) {
         // Saved by an earlier close (x.savedId); git no longer knows it: only the files are left to delete.
@@ -1490,6 +1495,7 @@ export async function guidedPlan(options = {}) {
   const now = options.now ?? Date.now();
   const scanned = await scan({ ...options, cwd, history: true, caches: true, worktrees: false });
   const items = [], notes = [];
+  options.onStatus?.({ label: 'Checking idle worktrees', done: 0, total: 0 });
   const close = await closePlan({ ...options, cwd, all: true, now });
   const groups = new Map();
   for (const x of close.candidates) { const key = x.project ?? basename(x.common ?? x.path); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(x); }
@@ -1532,19 +1538,25 @@ export function formatGuided(plan) {
 }
 
 /** Do the chosen items: worktrees first (work saved into one file per project), then caches, logs and leftovers. */
-export async function applyItems(plan, chosen, options = {}, say = () => {}) {
+export async function applyItems(plan, chosen, options = {}, say = () => {}, progress = null) {
   const receipt = { freed: 0, saved: 0, bundles: [], failed: [], moved: 0, trash: undefined };
+  const onStep = progress ? (step) => progress.set(step) : undefined;
   const close = chosen.filter((i) => i.kind === 'close').flatMap((i) => i.close);
   if (close.length) {
-    say(`Saving the work of ${close.length} folder(s), then removing them...`);
-    const r = await closeFolders({ candidates: close, at: plan.at }, options);
+    const label = 'Saving work, then removing folders';
+    if (progress) progress.set({ label, done: 0, total: close.length, note: '' });
+    else say(`Saving the work of ${close.length} folder(s), then removing them...`);
+    const r = await closeFolders({ candidates: close, at: plan.at }, { ...options, onStep });
     receipt.freed += r.freed; receipt.saved += r.saved.length; receipt.bundles.push(...r.bundles); receipt.failed.push(...r.failed);
+    progress?.stop({ ok: !r.failed.length, text: `Saved and removed ${r.closed.length} of ${close.length} folder(s)` });
   }
   const plans = chosen.filter((i) => i.kind === 'clean').flatMap((i) => i.plans);
   if (plans.length) {
-    say('Freeing caches, logs and leftovers...');
-    const r = await clean(plans, plan.at, options.runner ? { runner: options.runner } : {});
+    if (progress) progress.set({ label: 'Freeing caches, logs and leftovers', done: 0, total: 0, note: '' });
+    else say('Freeing caches, logs and leftovers...');
+    const r = await clean(plans, plan.at, { ...(options.runner ? { runner: options.runner } : {}), onStep });
     receipt.freed += r.bytes + r.movedBytes; receipt.moved += r.moved; receipt.trash = r.trash; receipt.failed.push(...r.failed);
+    progress?.stop({ ok: !r.failed.length, text: `Freed caches, logs and leftovers (${size(r.bytes + r.movedBytes)})` });
   }
   say('');
   say(`Done. About ${size(receipt.freed)} freed.${receipt.saved ? ` Work from ${receipt.saved} folder(s) saved in:` : ''}`);
@@ -1566,8 +1578,226 @@ export function formatForAgent(plan) {
   return lines.join('\n');
 }
 
-/** Ask, then do. `input`/`output` are streams (a terminal, or a test's). Returns what was done. */
+/** What a person meant at the review prompt. Plain words work as well as the single letters. */
+export function readAnswer(text) {
+  const t = String(text ?? '').trim().toLowerCase().replace(/[.!]+$/, '');
+  if (!t || !/\d/.test(t) && /^(go|go on|go ahead|yes|y|ok|okay|continue|proceed|start|done|enter|next|apply|do it)\b/.test(t)) return { action: 'go' };
+  if (/^(q|quit|exit|cancel|stop|abort)$/.test(t)) return { action: 'quit' };
+  if (/^(a|all|select all|everything)$/.test(t)) return { action: 'all' };
+  if (/^(n|none|select none|clear|nothing)$/.test(t)) return { action: 'none' };
+  const detail = /^(?:d|details?|show)\s*(\d+)$/.exec(t);
+  if (detail) return { action: 'detail', n: Number(detail[1]) };
+  const parts = t.split(/[\s,]+/).filter(Boolean);
+  if (parts.every((p) => /^\d+$/.test(p))) return { action: 'switch', numbers: parts.map(Number) };
+  return { action: 'unknown' };
+}
+
+const REVIEW_PROMPT = 'Press Enter to go on with the selected items.\nOr type: a (select all), n (select none), numbers to switch items (2 5), d 2 (details), q (quit).\n> ';
+
+// ---- The terminal UI. No dependencies: raw keys from node:readline, ANSI codes for colour and redraw. ----
+
+/** Colours, off with NO_COLOR or when the output is not a terminal. */
+function paint(output) {
+  const on = Boolean(output.isTTY) && !process.env.NO_COLOR;
+  const wrap = (code) => (text) => on ? `\x1b[${code}m${text}\x1b[0m` : String(text);
+  return { bold: wrap('1'), dim: wrap('2'), green: wrap('32'), yellow: wrap('33'), cyan: wrap('36'), red: wrap('31') };
+}
+
+/** Cut a line to `width` visible characters, keeping colour codes intact. */
+function fit(text, width) {
+  let out = '', n = 0, coloured = false;
+  for (const part of String(text).split(/(\x1b\[[0-9;]*m)/)) {
+    if (part.startsWith('\x1b[')) { out += part; coloured = true; continue; }
+    for (const ch of part) { if (n >= width) return out + (coloured ? '\x1b[0m' : ''); out += ch; n += 1; }
+  }
+  return out;
+}
+
+const tail = (text, width) => text.length > width ? `...${text.slice(text.length - width + 3)}` : text;
+const meter = (part, whole, width) => { const f = whole > 0 ? Math.max(part > 0 ? 1 : 0, Math.round(width * Math.min(1, part / whole))) : 0; return '█'.repeat(f) + '░'.repeat(width - f); };
+// Braille spinners need a modern terminal font; the old Windows console gets plain ones.
+const SPINNER = process.platform !== 'win32' || process.env.WT_SESSION || process.env.TERM_PROGRAM ? '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' : '|/-\\';
+
+/** Redraws a block of lines in place. */
+function screen(output) {
+  let drawn = 0;
+  return {
+    width: () => Math.max(40, (output.columns || 100) - 1),
+    rows: () => output.rows || 30,
+    draw(lines) {
+      const width = Math.max(40, (output.columns || 100) - 1);
+      output.write(`${drawn ? `\x1b[${drawn}A` : ''}\r\x1b[0J${lines.map((l) => fit(l, width)).join('\n')}\n`);
+      drawn = lines.length;
+    },
+    forget() { drawn = 0; },
+  };
+}
+
+/** One live line: a spinner, what is happening, a bar with "n of total" and the current folder or item. */
+export function progressLine(output) {
+  const c = paint(output);
+  if (!output.isTTY) return { set() {}, stop() {} };
+  const state = { label: '', done: 0, total: 0, note: '' };
+  let tick = 0, timer = null;
+  const render = () => {
+    const width = Math.max(40, (output.columns || 100) - 1);
+    const frame = SPINNER[tick++ % SPINNER.length];
+    const count = state.total ? `  ${c.dim(meter(state.done, state.total, 20))}  ${state.done} of ${state.total}` : '';
+    const left = `  ${c.cyan(frame)} ${state.label}${count}`;
+    const room = width - (state.label.length + (state.total ? 40 : 0) + 8);
+    const note = state.note && room > 12 ? `  ${c.dim(tail(state.note, room))}` : '';
+    output.write(`\r\x1b[2K${fit(left + note, width)}`);
+  };
+  return {
+    set(next) {
+      Object.assign(state, next);
+      if (!timer) { output.write('\x1b[?25l'); timer = setInterval(render, 90); timer.unref?.(); }
+      render();
+    },
+    stop(result) {
+      if (timer) clearInterval(timer);
+      timer = null;
+      const line = result ? `  ${result.ok === false ? c.yellow('!') : c.green('✓')} ${result.text}\n` : '';
+      output.write(`\r\x1b[2K${line}\x1b[?25h`);
+    },
+  };
+}
+
+/** Key presses from a terminal in raw mode, queued so a fast typist or a paste loses none. */
+function keyReader(input) {
+  const { emitKeypressEvents } = readlineModule;
+  emitKeypressEvents(input);
+  const queue = [], waiting = [];
+  const push = (k) => { if (waiting.length) waiting.shift()(k); else queue.push(k); };
+  const onKey = (str, key) => push({ str: str ?? '', key: key ?? {} });
+  const onEnd = () => push({ str: '', key: { name: 'eof' } });
+  input.setRawMode(true);
+  input.on('keypress', onKey);
+  input.on('end', onEnd);
+  input.resume();
+  return {
+    next: () => queue.length ? Promise.resolve(queue.shift()) : new Promise((done) => waiting.push(done)),
+    close() { input.off('keypress', onKey); input.off('end', onEnd); try { input.setRawMode(false); } catch {} input.pause(); },
+  };
+}
+let readlineModule;
+
+const isQuit = ({ key }) => key.name === 'eof' || key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c');
+
+function itemLines(plan, at, open, c, scr, message) {
+  const total = plan.items.reduce((s, i) => s + i.bytes, 0), chosen = plan.items.filter((i) => i.selected).reduce((s, i) => s + i.bytes, 0);
+  const largest = Math.max(1, ...plan.items.map((i) => i.bytes));
+  const lines = [`  ${c.bold(size(total))} can be freed. Choose what to free.`, ''];
+  plan.items.forEach((item, n) => {
+    const here = n === at;
+    const box = item.selected ? c.green('[x]') : c.dim('[ ]');
+    const split = item.label.indexOf(': ');
+    const title = split > 0 ? item.label.slice(0, split) : item.label, about = split > 0 ? item.label.slice(split + 2) : '';
+    const what = item.key === 'history' ? c.yellow(about) : c.dim(about);
+    lines.push(`${here ? c.cyan(' > ') : '   '}${box} ${size(item.bytes).padStart(8)}  ${c.dim(meter(item.bytes, largest, 10))}  ${here ? c.bold(title) : title}  ${what}`);
+    if (n === open) {
+      const room = Math.max(3, scr.rows() - plan.items.length - 12);
+      for (const d of item.detail.slice(0, room)) lines.push(`        ${c.dim(d)}`);
+      if (item.detail.length > room) lines.push(`        ${c.dim(`and ${item.detail.length - room} more`)}`);
+    }
+  });
+  lines.push('');
+  if (plan.kept.length) lines.push(c.dim(`  Kept as they are (${plan.kept.length}): ${plan.kept.slice(0, 3).map((k) => `${k.branch ?? basename(k.path)} (${k.keep})`).join(', ')}${plan.kept.length > 3 ? ', ...' : ''}`));
+  for (const note of plan.notes) lines.push(c.dim(`  ${note}`));
+  lines.push(`  Selected: ${c.bold(size(chosen))} of ${size(total)}`, '');
+  lines.push(message ? `  ${c.yellow(message)}` : `  ${c.bold('Up/Down')} move   ${c.bold('Space')} select   ${c.bold('A')} all   ${c.bold('Right')} details   ${c.bold('Enter')} continue   ${c.bold('Q')} quit`);
+  return lines;
+}
+
+/** The list: arrow keys move, space selects, Enter continues. Returns 'go' or 'quit'. */
+async function pickItems(plan, keys, scr, c) {
+  let at = 0, open = -1, message = '';
+  for (;;) {
+    scr.draw(itemLines(plan, at, open, c, scr, message));
+    message = '';
+    const press = await keys.next(), { key, str } = press, n = plan.items.length;
+    if (isQuit(press)) return 'quit';
+    if (key.name === 'up' || key.name === 'k') at = (at + n - 1) % n;
+    else if (key.name === 'down' || key.name === 'j' || key.name === 'tab') at = (at + 1) % n;
+    else if (key.name === 'space' || key.name === 'x') plan.items[at].selected = !plan.items[at].selected;
+    else if (key.name === 'a') { const all = plan.items.every((i) => i.selected); plan.items.forEach((i) => { i.selected = !all; }); }
+    else if (key.name === 'n') plan.items.forEach((i) => { i.selected = false; });
+    else if (key.name === 'right' || key.name === 'l' || key.name === 'd') open = open === at ? -1 : at;
+    else if (key.name === 'left' || key.name === 'h') open = -1;
+    else if (/^[1-9]$/.test(str) && Number(str) <= n) { at = Number(str) - 1; plan.items[at].selected = !plan.items[at].selected; }
+    else if (key.name === 'return' || key.name === 'enter') {
+      if (plan.items.some((i) => i.selected)) return 'go';
+      message = 'Nothing is selected. Press Space on an item, or A for all.';
+    }
+  }
+}
+
+/** Yes / back / quit, by arrow keys (or y, n, q). */
+async function confirmChoice(plan, chosen, keys, scr, c) {
+  const folders = chosen.filter((i) => i.kind === 'close').reduce((n, i) => n + i.close.length, 0);
+  const freed = size(chosen.reduce((s, i) => s + i.bytes, 0));
+  const options = [
+    { value: 'yes', label: folders ? `Yes: save the work of ${folders} folder(s), then free about ${freed}` : `Yes: free about ${freed}` },
+    { value: 'back', label: 'No: back to the list' },
+    { value: 'quit', label: 'Quit without changing anything' },
+  ];
+  let at = 0;
+  for (;;) {
+    const lines = [`  ${c.bold('Ready.')}`];
+    if (folders) lines.push(c.dim(`  Each folder's work is saved into one file per project first. codein-tidy restore <id> puts one back.`));
+    if (chosen.some((i) => i.key === 'history')) lines.push(`  ${c.yellow('Old chat history will be deleted for good.')}`);
+    lines.push('');
+    options.forEach((o, n) => lines.push(`${n === at ? c.cyan(' > ') : '   '}${n === at ? c.bold(o.label) : o.label}`));
+    lines.push('', `  ${c.bold('Up/Down')} move   ${c.bold('Enter')} choose`);
+    scr.draw(lines);
+    const press = await keys.next(), { key } = press;
+    if (isQuit(press)) return 'quit';
+    if (key.name === 'y') return 'yes';
+    if (key.name === 'n' || key.name === 'left' || key.name === 'backspace') return 'back';
+    if (key.name === 'up' || key.name === 'k') at = (at + options.length - 1) % options.length;
+    else if (key.name === 'down' || key.name === 'j' || key.name === 'tab') at = (at + 1) % options.length;
+    else if (key.name === 'return' || key.name === 'enter') return options[at].value;
+  }
+}
+
+/** The whole job in a terminal: scan with a live bar, pick with the arrow keys, confirm, then do it with a live bar. */
+async function guidedTui({ input, output, options }) {
+  readlineModule ??= await import('node:readline');
+  const c = paint(output), scr = screen(output), progress = progressLine(output);
+  const say = (text) => output.write(text + '\n');
+  say('');
+  say(`  ${c.bold('codein-tidy')}  ${c.dim('frees what AI coding tools leave behind')}`);
+  say('');
+  progress.set({ label: 'Looking at what AI coding tools left', done: 0, total: 0, note: '' });
+  let plan;
+  try { plan = await guidedPlan({ ...options, onStatus: (s) => progress.set({ note: '', ...s }) }); }
+  finally { progress.stop(); }
+  if (!plan.items.length) { say(`  ${c.green('✓')} Nothing to free: everything is in use or still recent.`); return { done: false }; }
+  const keys = keyReader(input);
+  let chosen;
+  output.write('\x1b[?25l');
+  try {
+    for (;;) {
+      if (await pickItems(plan, keys, scr, c) === 'quit') { say(''); say('  Nothing was changed.'); return { done: false }; }
+      chosen = plan.items.filter((i) => i.selected);
+      const answer = await confirmChoice(plan, chosen, keys, scr, c);
+      if (answer === 'quit') { say(''); say('  Nothing was changed.'); return { done: false }; }
+      if (answer === 'yes') break;
+    }
+  } finally { keys.close(); output.write('\x1b[?25h'); }
+  scr.forget();
+  say('');
+  const receipt = await applyItems(plan, chosen, options, (line) => say(line.startsWith('Done.') ? `  ${c.green(c.bold(line))}` : line ? `  ${line}` : ''), progress);
+  return { done: true, receipt };
+}
+
+/** Ask, then do. In a terminal: arrow keys and live progress. Through a pipe (an agent, a test): plain words. */
 export async function guidedRun({ input = process.stdin, output = process.stdout, options = {} } = {}) {
+  if (input.isTTY && typeof input.setRawMode === 'function' && output.isTTY) return guidedTui({ input, output, options });
+  return guidedLines({ input, output, options });
+}
+
+async function guidedLines({ input, output, options }) {
   const { createInterface } = await import('node:readline');
   const rl = createInterface({ input, output, terminal: false });
   const lines = rl[Symbol.asyncIterator]();
@@ -1577,20 +1807,39 @@ export async function guidedRun({ input = process.stdin, output = process.stdout
     say('Looking at everything AI coding tools left on this machine. This reads only...');
     const plan = await guidedPlan(options);
     if (!plan.items.length) { say('Nothing to free: everything is in use or still recent.'); return { done: false }; }
+    let redraw = true;
     for (;;) {
-      say(''); say(formatGuided(plan));
-      const answer = (await ask('Enter: go on with the selected items. a: all. n: none. Numbers (2 5): switch items. d 1: details. q: quit.\n> ')).toLowerCase();
-      if (answer === 'q') { say('Nothing was changed.'); return { done: false }; }
-      if (answer === 'a') { plan.items.forEach((i) => { i.selected = true; }); continue; }
-      if (answer === 'n') { plan.items.forEach((i) => { i.selected = false; }); continue; }
-      const detail = /^d\s*(\d+)$/.exec(answer);
-      if (detail) { const item = plan.items[Number(detail[1]) - 1]; if (item) { say(''); say(item.label); item.detail.forEach((d) => say(`    ${d}`)); } continue; }
-      if (answer) { for (const n of answer.split(/[\s,]+/).map(Number)) if (plan.items[n - 1]) plan.items[n - 1].selected = !plan.items[n - 1].selected; continue; }
+      if (redraw) { say(''); say(formatGuided(plan)); }
+      redraw = true;
+      const raw = await ask(REVIEW_PROMPT);
+      const answer = readAnswer(raw);
+      if (answer.action === 'quit') { say('Nothing was changed.'); return { done: false }; }
+      if (answer.action === 'all') { plan.items.forEach((i) => { i.selected = true; }); continue; }
+      if (answer.action === 'none') { plan.items.forEach((i) => { i.selected = false; }); continue; }
+      if (answer.action === 'detail') {
+        const item = plan.items[answer.n - 1];
+        if (item) { say(''); say(item.label); item.detail.forEach((d) => say(`    ${d}`)); }
+        else say(`There is no item ${answer.n}.`);
+        redraw = false; continue;
+      }
+      if (answer.action === 'switch') {
+        const missing = answer.numbers.filter((n) => !plan.items[n - 1]);
+        for (const n of answer.numbers) if (plan.items[n - 1]) plan.items[n - 1].selected = !plan.items[n - 1].selected;
+        if (missing.length) say(`There is no item ${missing.join(', ')}.`);
+        continue;
+      }
+      if (answer.action === 'unknown') { say(`Not sure what "${raw}" means.`); redraw = false; continue; }
       const chosen = plan.items.filter((i) => i.selected);
-      if (!chosen.length) { say('Nothing is selected.'); continue; }
+      if (!chosen.length) { say('Nothing is selected. Type a to select all, or item numbers.'); redraw = false; continue; }
       const folders = chosen.filter((i) => i.kind === 'close').reduce((n, i) => n + i.close.length, 0);
-      const yes = (await ask(`\n${folders ? `Save the work of ${folders} folder(s) into one file per project, then free` : 'Free'} about ${size(chosen.reduce((s, i) => s + i.bytes, 0))}? (y/n) `)).toLowerCase();
-      if (yes !== 'y' && yes !== 'yes') { say('Nothing was changed.'); return { done: false }; }
+      const question = `\n${folders ? `Save the work of ${folders} folder(s) into one file per project, then free` : 'Free'} about ${size(chosen.reduce((s, i) => s + i.bytes, 0))}? Type y to go ahead, n to stop: `;
+      let confirm = '';
+      for (;;) {
+        confirm = (await ask(question)).toLowerCase();
+        if (/^(y|yes|go|ok|okay|go ahead)$/.test(confirm) || /^(n|no|q|quit|stop|cancel)$/.test(confirm)) break;
+        say('Type y or n.');
+      }
+      if (!/^(y|yes|go|ok|okay|go ahead)$/.test(confirm)) { say('Nothing was changed.'); return { done: false }; }
       return { done: true, receipt: await applyItems(plan, chosen, options, say) };
     }
   } finally { rl.close(); }
