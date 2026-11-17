@@ -7,8 +7,32 @@ Works with **Claude Code, Codex, Cursor and Antigravity** on Windows, macOS and 
 
 ```
 npx codein-tidy            # report: reads only
+npx codein-tidy work       # unfinished work in this project, from every tool: reads only
 npx codein-tidy clean      # shows the plan, removes nothing
 npx codein-tidy clean --yes
+```
+
+## Unfinished work
+
+Agents leave work behind in worktrees: a Codex task never committed, a Claude Code subagent's commit never
+merged. Switch tools and you no longer know it exists. `npx codein-tidy work` lists every working folder of the
+project you run it in (the main checkout and every worktree, whichever tool made it) by stage:
+
+| Stage | Meaning |
+|---|---|
+| Uncommitted work | real changes; agent leftovers are counted apart, never as work |
+| Committed, not pushed | commits that exist on no remote, so on this machine only |
+| Pushed, not in the release branch | the remote's default branch, or `"release"` in `.codein-tidy.json` |
+
+Whether the release branch is live is not checked. `--all` lists every project the tools' worktrees belong to.
+
+**At the start of every session.** The Claude Code plugin runs `work --notice` when a session starts: when
+the project has unfinished work, the agent sees a short list and is told to tell you before starting something
+new. When everything is finished it prints nothing. For Codex, add this to `~/.codex/hooks.json` (not yet
+tested here):
+
+```json
+{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "npx -y codein-tidy@latest work --notice", "timeout": 60}]}]}}
 ```
 
 ## What it removes
@@ -85,6 +109,7 @@ is on its way).
 | Command | What it does |
 |---|---|
 | `report` | Reads only. Shows what each tool keeps and what can be freed. |
+| `work` | Reads only. Unfinished work in this project by stage. `--all` for every project, `--notice` for the short session-start form, `--json`. |
 | `clean` | Shows the plan. Add `--yes` to carry it out. |
 | `review` | Lists worktrees holding uncommitted work, split into real work and agent leftovers. |
 | `prepare --project=PATH` | Moves a worktree's agent leftovers to trash and ignores agent state locally. Add `--yes`. |

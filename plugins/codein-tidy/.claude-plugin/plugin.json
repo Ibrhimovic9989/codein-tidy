@@ -1,7 +1,7 @@
 {
   "name": "codein-tidy",
-  "version": "0.1.2",
-  "description": "See and safely free the disk space AI coding tools leave behind. Uncommitted work is never deleted.",
+  "version": "0.2.0",
+  "description": "Shows unfinished work at the start of every session and safely frees the disk space AI coding tools leave behind. Uncommitted work is never deleted.",
   "author": {
     "name": "code.in",
     "url": "https://code.in"
@@ -13,5 +13,6 @@
     "disk-space",
     "cleanup",
     "worktrees"
-  ]
+  ],
+  "hooks": "./hooks/claude-code.json"
 }

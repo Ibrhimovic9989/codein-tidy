@@ -289,6 +289,129 @@ async function findWorktrees(root, depth) {
   return found;
 }
 
+/**
+ * Unfinished work: every working folder of a project (the main checkout and each worktree, whichever tool made
+ * it), and how far its work has got. Read-only. Stages, from least to most finished:
+ *   uncommitted   real changes (agent leftovers and agent state are counted apart, never as work)
+ *   not pushed    commits that exist on no remote, so on this machine only
+ *   not merged    pushed, but not in the release branch (the remote's default branch, or .codein-tidy.json "release")
+ *   in release    nothing to do
+ * Whether the release branch is live is not known from git; it is reported as not checked, never guessed.
+ */
+const gitAsync = (args, cwd) => new Promise((done) => execFile('git', args,
+  { cwd, encoding: 'utf8', windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout: 60_000 }, (error, out) => done(error ? null : out)));
+
+async function pool(items, size, work) {
+  const out = new Array(items.length); let next = 0;
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, async () => { while (next < items.length) { const at = next++; out[at] = await work(items[at]); } }));
+  return out;
+}
+
+export function madeBy(path, main = false) {
+  if (main) return 'main checkout';
+  if (/[\\/]\.claude[\\/]worktrees[\\/]agent-/.test(path)) return 'Claude Code subagent';
+  if (/[\\/]\.claude[\\/]worktrees[\\/]/.test(path)) return 'Claude Code';
+  if (/[\\/]\.codex[\\/]worktrees[\\/]/.test(path)) return 'Codex';
+  if (/[\\/]\.cursor[\\/]worktrees[\\/]/.test(path)) return 'Cursor';
+  if (/[\\/]opencode[\\/]worktree[\\/]/i.test(path)) return 'OpenCode';
+  return 'git command';
+}
+
+/** Sort `git status --untracked-files=normal` entries into real work and agent leftovers. Fast: no file walk. */
+function sortStatus(raw) {
+  const out = { work: [], leftovers: 0 };
+  for (const line of raw.split(String.fromCharCode(0)).filter((l) => /^[ MADRCU?!]{2} /.test(l))) {
+    const code = line.slice(0, 2), rel = line.slice(3);
+    if (code === '??' && (PROJECT_JUNK.some((rule) => rule.test(rel)) || AGENT_STATE_DIRS.includes(rel.split('/')[0]))) out.leftovers += 1;
+    else out.work.push(line);
+  }
+  return out;
+}
+
+async function releaseBranch(main) {
+  try {
+    const config = JSON.parse(await fs.readFile(join(main, '.codein-tidy.json'), 'utf8'));
+    if (typeof config.release === 'string' && config.release) return config.release;
+  } catch {}
+  return (await gitAsync(['symbolic-ref', '--quiet', '--short', 'refs/remotes/origin/HEAD'], main))?.trim() || null;
+}
+
+export async function unfinishedWork(options = {}) {
+  const here = resolve(options.cwd ?? process.cwd());
+  const seeds = [options.project ?? here];
+  if (options.all) for (const t of targets(options).filter((t) => t.kind === 'worktrees')) seeds.push(...await findWorktrees(t.path, 2));
+  const commons = new Set();
+  for (const seed of seeds) { const c = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], seed); if (c) commons.add(resolve(c)); }
+  const projects = [];
+  for (const common of commons) {
+    const text = git(['worktree', 'list', '--porcelain'], common);
+    if (!text) continue;
+    const folders = text.split(/\r?\n\r?\n/).map((b) => b.split(/\r?\n/)).filter((l) => l[0]?.startsWith('worktree ') && !l.includes('bare'))
+      .map((l, i) => ({ path: resolve(l[0].slice(9)), main: i === 0, missing: l.some((x) => x.startsWith('prunable')),
+        branch: (l.find((x) => x.startsWith('branch ')) ?? '').replace('branch refs/heads/', '') || null }));
+    const main = folders[0]?.path;
+    if (!main) continue;
+    const release = await releaseBranch(main);
+    const hasRemote = Boolean((await gitAsync(['remote'], main))?.trim());
+    const rows = await pool(folders.filter((f) => !f.missing), 8, async (f) => {
+      const raw = await gitAsync(['status', '--porcelain=v1', '-z', '--untracked-files=normal'], f.path);
+      if (raw === null) return { ...f, madeBy: madeBy(f.path, f.main), stage: 'unreadable', changed: 0, leftovers: 0, unpushed: 0 };
+      const { work, leftovers } = sortStatus(raw);
+      const unpushed = hasRemote ? Number((await gitAsync(['rev-list', '--count', 'HEAD', '--not', '--remotes'], f.path)) ?? 0) : null;
+      const merged = release ? (await gitAsync(['merge-base', '--is-ancestor', 'HEAD', release], f.path)) !== null : null;
+      const [when = '0', subject = ''] = ((await gitAsync(['log', '-1', '--format=%ct%x09%s'], f.path)) ?? '').trim().split('\t');
+      const touched = Math.max(Number(when) * 1000, await newest(f.path, 1));
+      const stage = work.length ? 'uncommitted' : !hasRemote ? 'no remote' : unpushed > 0 ? 'not pushed' : merged === false ? 'not merged' : merged ? 'in release' : 'pushed';
+      return { ...f, madeBy: madeBy(f.path, f.main), stage, changed: work.length, sample: work.slice(0, 5), leftovers, unpushed: unpushed ?? 0,
+        idleDays: Math.max(0, Math.floor(((options.now ?? Date.now()) - touched) / DAY)), lastCommit: subject };
+    });
+    projects.push({ name: basename(main), main, release, hasRemote, live: 'not checked', folders: rows });
+  }
+  return projects;
+}
+
+const STAGE_ORDER = ['uncommitted', 'not pushed', 'no remote', 'not merged', 'unreadable'];
+const STAGE_TITLE = { uncommitted: 'Uncommitted work', 'not pushed': 'Committed, not pushed (only on this machine)',
+  'no remote': 'Committed, the project has no remote', 'not merged': 'Pushed, not in the release branch', unreadable: 'Could not be read' };
+const what = (f) => f.stage === 'uncommitted' ? `${f.changed} changed file(s)${f.unpushed ? ` + ${f.unpushed} unpushed commit(s)` : ''}`
+  : f.stage === 'not pushed' ? `${f.unpushed} commit(s)` : f.stage === 'not merged' ? 'pushed' : f.stage;
+
+export function formatWork(projects) {
+  const lines = [];
+  for (const p of projects) {
+    const open = p.folders.filter((f) => STAGE_ORDER.includes(f.stage));
+    lines.push(`${p.name}: ${p.folders.length} working folder(s), ${open.length} with unfinished work. Release branch: ${p.release ?? 'unknown (set "release" in .codein-tidy.json)'}. Live: not checked.`);
+    for (const stage of STAGE_ORDER) {
+      const list = open.filter((f) => f.stage === stage).sort((a, b) => b.idleDays - a.idleDays);
+      if (!list.length) continue;
+      lines.push('', `  ${STAGE_TITLE[stage]} (${list.length})`);
+      for (const f of list) lines.push(`    ${(f.branch ?? '(no branch)').slice(0, 42).padEnd(42)} ${f.madeBy.padEnd(20)} ${what(f).padEnd(28)} idle ${String(f.idleDays).padStart(3)} d  ${f.path}`);
+    }
+    const done = p.folders.filter((f) => !STAGE_ORDER.includes(f.stage)).length;
+    const junk = p.folders.filter((f) => f.leftovers).length;
+    lines.push('', `  Finished (${p.release ? `in ${p.release}` : 'pushed'}): ${done} folder(s).${junk ? ` Agent leftovers (not work) in ${junk} folder(s): codein-tidy prepare --project=<folder> moves them to trash.` : ''}`, '');
+  }
+  if (!projects.length) lines.push('Not inside a git project. Run it from a project folder, or add --all.');
+  return lines.join('\n').trimEnd();
+}
+
+/** The short version an agent sees when a session starts. Empty when nothing is unfinished. */
+export function formatNotice(projects) {
+  const p = projects[0];
+  const open = p ? p.folders.filter((f) => STAGE_ORDER.includes(f.stage) && f.stage !== 'unreadable') : [];
+  if (!open.length) return '';
+  const count = (s) => open.filter((f) => f.stage === s).length;
+  const parts = [['uncommitted', 'hold uncommitted work'], ['not pushed', 'hold commits that are not pushed'], ['no remote', 'hold commits (no remote)'], ['not merged', `are pushed but not in ${p.release}`]]
+    .filter(([s]) => count(s)).map(([s, t]) => `${count(s)} ${t}`);
+  const top = [...open].sort((a, b) => STAGE_ORDER.indexOf(a.stage) - STAGE_ORDER.indexOf(b.stage) || b.changed + b.unpushed - (a.changed + a.unpushed)).slice(0, 6);
+  return [`codein-tidy: unfinished work in ${p.name} (${open.length} of ${p.folders.length} working folders): ${parts.join(', ')}.`,
+    ...top.map((f) => `- ${f.path} | ${f.branch ?? 'no branch'} | ${f.madeBy} | ${what(f)} | idle ${f.idleDays} d`),
+    ...(open.length > top.length ? [`- and ${open.length - top.length} more: npx codein-tidy work`] : []),
+    'Tell the person about this unfinished work before starting something new, and offer to finish it. Never delete, reset or stash it.',
+    'To finish one: read it (git -C <folder> status, git -C <folder> diff), commit it on its branch with a clear message, then ask the person before pushing or merging.',
+  ].join('\n');
+}
+
 /** Every worktree git lists for a repository (run in its common git folder). The first is the main one. */
 function linkedWorktrees(common) {
   const text = git(['worktree', 'list', '--porcelain'], common);
@@ -437,6 +560,10 @@ const PROJECT_JUNK = [
   { why: 'Screenshots', test: (rel) => /\.(png|jpe?g|webp|gif)$/i.test(rel) &&
       (!rel.includes('/') || /(^|\/)(screenshots?|shots|captures)\//i.test(rel) || /screen[-_ ]?shot|^capture/i.test(rel.split('/').pop())) },
   { why: 'Temporary scripts and files', test: (rel) => /^(\.tmp-|\.tmp_|tmp-)/i.test(rel.split('/')[0]) || /\.tmp$/i.test(rel) },
+  // Throwaway folders agents create at the top of a project (.test-tmp, .rw36-tmp, tmp) and probe files
+  // (.diag-db-host.mjs, .debug-build-inspect.ts, .candidate2-body.txt): seen holding 13,700 files in one worktree.
+  { why: 'Temporary folders', test: (rel) => /^(\.?tmp|\.[\w-]*-tmp)$/i.test(rel.split('/')[0]) && (rel.includes('/') || rel.endsWith('/')) },
+  { why: 'Probe and diagnostic files', test: (rel) => !rel.includes('/') && /^\.(diag|debug|probe|candidate\d*)[-_.]/i.test(rel) },
   { why: 'Stray files from shell mistakes', test: (rel) => ['nul', '-', '$null'].includes(rel.toLowerCase()) },
   { why: 'PowerShell cache written into the project', test: (rel) => rel.startsWith('Microsoft/Windows/PowerShell/') },
 ];
@@ -722,9 +849,23 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  if (!['report', 'clean', 'review', 'prepare'].includes(command) || (older && !(options.olderThanDays >= 1)) || (command === 'prepare' && !options.project)) {
-    console.error('Usage: codein-tidy [report | review | prepare --project=PATH [--yes] | clean [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');
+  if (!['report', 'clean', 'review', 'prepare', 'work'].includes(command) || (older && !(options.olderThanDays >= 1)) || (command === 'prepare' && !options.project)) {
+    console.error('Usage: codein-tidy [report | work [--all] [--notice] | review | prepare --project=PATH [--yes] | clean [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');
     process.exitCode = 2; return;
+  }
+  if (command === 'work') {
+    if (args.has('--notice')) {
+      // Runs at the start of every agent session: never fail it, never slow it past the cap, print nothing when clean.
+      try {
+        const projects = await Promise.race([unfinishedWork(options), new Promise((done) => setTimeout(() => done(null), 20_000).unref())]);
+        const text = projects ? formatNotice(projects) : '';
+        if (text) console.log(text);
+      } catch {}
+      return;
+    }
+    const projects = await unfinishedWork({ ...options, all: args.has('--all') });
+    console.log(args.has('--json') ? JSON.stringify(projects, null, 2) : formatWork(projects));
+    return;
   }
   if (command === 'prepare') {
     const result = await prepareWorktree(options.project, { yes: args.has('--yes') });

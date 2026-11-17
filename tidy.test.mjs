@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -455,4 +455,89 @@ test('Windows: the fast listing of a copied node_modules equals the exact walk',
     assert.deepEqual([fast.bytes, fast.files], [walked.bytes, walked.files]);
     assert.equal(fast.bytes, 6 * 1000 + 15 + 4);
   } finally { delete process.env.CODEIN_TIDY_NO_ROBOCOPY; }
+});
+
+async function project(m) {
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const remote = join(m.root, 'remote.git'), repo = join(m.root, 'app');
+  g(['init', '--bare', '-q', '-b', 'main', remote], m.root);
+  g(['clone', '-q', remote, repo], m.root);
+  for (const [k, v] of [['user.email', 't@example.com'], ['user.name', 't'], ['commit.gpgsign', 'false']]) g(['config', k, v], repo);
+  g(['checkout', '-q', '-b', 'main'], repo);
+  await writeFile(join(repo, 'a.txt'), 'a'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'a'], repo); g(['push', '-q', '-u', 'origin', 'main'], repo);
+  g(['remote', 'set-head', 'origin', 'main'], repo);
+  return { g, repo };
+}
+
+test('work: every folder of a project by stage; leftovers are never counted as work', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const wip = join(m.root, 'wt', 'wip'), local = join(m.home, '.codex', 'worktrees', 'local', 'app'), review = join(m.root, 'wt', 'review'), done = join(m.root, 'wt', 'done');
+  g(['worktree', 'add', '-q', '-b', 'wip', wip], repo);
+  await writeFile(join(wip, 'feature.js'), 'real work');
+  await aged(join(wip, '.tmp-probe.py'), 0); await aged(join(wip, '.test-tmp', 'run1', 'x.json'), 0); await aged(join(wip, '.diag-db-host.mjs'), 0);
+  g(['worktree', 'add', '-q', '-b', 'local', local], repo);
+  await writeFile(join(local, 'b.txt'), 'b'); g(['add', '.'], local); g(['commit', '-q', '-m', 'b'], local);
+  g(['worktree', 'add', '-q', '-b', 'review', review], repo);
+  await writeFile(join(review, 'c.txt'), 'c'); g(['add', '.'], review); g(['commit', '-q', '-m', 'c'], review); g(['push', '-q', 'origin', 'review'], review);
+  g(['worktree', 'add', '-q', '--detach', done, 'main'], repo);
+
+  const [p] = await unfinishedWork({ ...m.options, cwd: repo });
+  assert.equal(p.name, 'app'); assert.equal(p.release, 'origin/main');
+  const by = Object.fromEntries(p.folders.map((f) => [f.path, f]));
+  assert.deepEqual([by[wip].stage, by[wip].changed, by[wip].leftovers], ['uncommitted', 1, 3]);
+  assert.deepEqual([by[local].stage, by[local].unpushed, by[local].madeBy], ['not pushed', 1, 'Codex']);
+  assert.equal(by[review].stage, 'not merged');
+  assert.equal(by[done].stage, 'in release');
+  assert.equal(by[repo].stage, 'in release'); assert.equal(by[repo].madeBy, 'main checkout');
+
+  const notice = formatNotice([p]);
+  assert.match(notice, /unfinished work in app \(3 of 5 working folders\): 1 hold uncommitted work, 1 hold commits that are not pushed, 1 are pushed but not in origin\/main\./);
+  assert.match(notice, /Never delete, reset or stash it/);
+  assert.equal(notice.includes(done), false);
+  assert.match(formatWork([p]), /Finished \(in origin\/main\): 2 folder\(s\)\. Agent leftovers \(not work\) in 1 folder/);
+
+  // Once the work is finished, the notice says nothing at all.
+  g(['add', 'feature.js'], wip); g(['commit', '-q', '-m', 'feature'], wip); g(['push', '-q', 'origin', 'wip'], wip);
+  for (const [tree, branch] of [[wip, 'wip'], [local, 'local'], [review, 'review']]) {
+    if (branch === 'local') g(['push', '-q', 'origin', 'local'], tree);
+    g(['checkout', '-q', 'main'], repo); g(['merge', '-q', '--no-edit', branch], repo);
+  }
+  g(['push', '-q', 'origin', 'main'], repo);
+  assert.equal(formatNotice(await unfinishedWork({ ...m.options, cwd: repo })), '');
+});
+
+test('work: a project without a remote, and the release branch from .codein-tidy.json', async () => {
+  const m = await machine();
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const solo = join(m.root, 'solo');
+  g(['init', '-q', solo], m.root);
+  for (const [k, v] of [['user.email', 't@example.com'], ['user.name', 't'], ['commit.gpgsign', 'false']]) g(['config', k, v], solo);
+  await writeFile(join(solo, 'a.txt'), 'a'); g(['add', '.'], solo); g(['commit', '-q', '-m', 'a'], solo);
+  const [p] = await unfinishedWork({ ...m.options, cwd: solo });
+  assert.equal(p.folders[0].stage, 'no remote');
+  assert.match(formatNotice([p]), /1 hold commits \(no remote\)/);
+
+  const { g: g2, repo } = await project(m);
+  g2(['checkout', '-q', '-b', 'release'], repo); g2(['push', '-q', 'origin', 'release'], repo);
+  await writeFile(join(repo, '.codein-tidy.json'), JSON.stringify({ release: 'origin/release' }));
+  await writeFile(join(repo, '.git', 'info', 'exclude'), '.codein-tidy.json\n');
+  const [q] = await unfinishedWork({ ...m.options, cwd: repo });
+  assert.equal(q.release, 'origin/release');
+  assert.equal(q.folders[0].stage, 'in release');
+});
+
+test('work --notice prints nothing outside a git project and never fails', async () => {
+  const m = await machine();
+  const env = { ...process.env, HOME: m.home, USERPROFILE: m.home, TEMP: m.temp, TMP: m.temp, APPDATA: join(m.root, 'roaming'), LOCALAPPDATA: join(m.root, 'local') };
+  const out = execFileSync(process.execPath, [join(process.cwd(), 'tidy.mjs'), 'work', '--notice'], { cwd: m.root, env, encoding: 'utf8' });
+  assert.equal(out, '');
+});
+
+test('the plugin carries the same tool its session-start hook runs', async () => {
+  const { readFile } = await import('node:fs/promises');
+  assert.equal(await readFile(join(process.cwd(), 'plugins', 'codein-tidy', 'scripts', 'tidy.mjs'), 'utf8'), await readFile(join(process.cwd(), 'tidy.mjs'), 'utf8'),
+    'plugins/codein-tidy/scripts/tidy.mjs is stale: copy tidy.mjs over it');
+  const hooks = JSON.parse(await readFile(join(process.cwd(), 'plugins', 'codein-tidy', 'hooks', 'claude-code.json'), 'utf8'));
+  assert.match(hooks.hooks.SessionStart[0].hooks[0].command, /scripts\/tidy\.mjs" work --notice$/);
 });

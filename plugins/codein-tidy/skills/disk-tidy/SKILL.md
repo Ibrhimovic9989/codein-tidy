@@ -1,6 +1,6 @@
 ---
 name: disk-tidy
-description: Show and safely free the disk space that AI coding tools (Claude Code, Codex, Cursor, Antigravity) leave behind - old snapshots, caches, logs, browser recordings, old app versions and stale worktrees. Use when the user says their disk is full, asks what is using space, or asks to clean up after coding agents.
+description: Show unfinished work left in a project's worktrees by any coding agent, and safely free the disk space that AI coding tools (Claude Code, Codex, Cursor, Antigravity) leave behind - old snapshots, caches, logs, browser recordings, old app versions and stale worktrees. Use when a session starts with a codein-tidy notice, when the user asks what work is unfinished or not deployed, says their disk is full, asks what is using space, or asks to clean up after coding agents.
 ---
 
 # Disk tidy
@@ -31,6 +31,25 @@ This skill measures them and removes only what is safe.
    ```
 
 5. Report the "Removed ... freed" line exactly as printed, and any item it could not remove.
+
+## Unfinished work
+
+Work done in one tool is invisible to the next: a Codex task left uncommitted, a Claude Code subagent's commit
+that was never merged. In Claude Code this plugin prints a short notice at the start of every session when the
+project has unfinished work. In any tool, list it yourself:
+
+```
+npx -y codein-tidy@latest work
+```
+
+It lists every working folder of the project (the main checkout and every worktree, whichever tool made it)
+by stage: uncommitted, committed but not pushed, pushed but not in the release branch. The release branch is
+the remote's default branch, or `"release"` in `.codein-tidy.json`. Whether it is live is not checked.
+
+When you see unfinished work:
+1. Tell the user what is there before starting something new, and offer to finish it.
+2. For each folder the user wants finished, follow "Worktrees with uncommitted work" below to commit it.
+3. Ask the user before pushing or merging anything. Never delete, reset or stash the work.
 
 ## Worktrees with uncommitted work
 
