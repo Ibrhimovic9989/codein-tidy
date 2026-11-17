@@ -12,10 +12,11 @@
  *   4. App caches are skipped while that app is running.
  *   5. Nothing outside the listed folders is touched; symlinks are never followed.
  */
-import { promises as fs } from 'node:fs';
+import { promises as fs, copyFileSync } from 'node:fs';
 import { homedir, tmpdir, platform } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
 import { execFile, execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 
 const DAY = 24 * 60 * 60_000;
 // Measuring is millions of small file-system calls; Node runs them on a pool of 4 threads by default. The pool
@@ -839,6 +840,166 @@ export function formatReport(plans, { cleaning = false } = {}) {
   return lines.join('\n').trimStart();
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Save: a working folder's work becomes a commit, plus a copy of the local files git ignores, so the folder can go.
+//
+// The snapshot is the folder exactly as it is (tracked and untracked files, minus untracked agent state), built in
+// a throwaway index: the folder's own index, branch and hooks are never touched. It is kept under refs/tidy/ in the
+// project's own repository and copied into a bundle file. Ignored files that a package manager or a build cannot
+// recreate (.env.local, local config) are copied to a keep folder outside git, never into a commit. A save counts
+// only when a fresh tree of the folder equals the snapshot and every kept file's hash matches.
+// ---------------------------------------------------------------------------------------------------------------
+
+/** Folders a package manager or a build fills again: never the only copy of anything. */
+const REBUILT_DIRS = new Set(['node_modules', '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', 'target',
+  'dist', 'build', '.next', '.turbo', 'out', 'coverage', '.cache', '.parcel-cache', '.svelte-kit', '.nuxt', '.gradle', '.pnpm-store',
+  '.yarn', '.expo', '.vercel', '.output', 'bower_components', '.terraform']);
+/** Single files a build or tool writes again. */
+const REBUILT_FILES = /(\.tsbuildinfo|\.pyc|\.pyo)$|^(\.eslintcache|\.stylelintcache|\.DS_Store|Thumbs\.db)$/i;
+const KEEP_FILE_LIMIT = 20 * 1024 ** 2, KEEP_TOTAL_LIMIT = 200 * 1024 ** 2;
+const tidyHome = (options = {}) => join(options.home ?? homedir(), '.codein-tidy');
+const slug = (text) => String(text).replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60) || 'folder';
+const stampOf = (now) => new Date(now).toISOString().replace(/[:.]/g, '-');
+const sha256 = async (path) => createHash('sha256').update(await fs.readFile(path)).digest('hex');
+
+/** The tree of a folder exactly as it is now, built in a throwaway index. Null if git cannot build it. */
+function folderTree(top, excluded = []) {
+  const scratch = join(tmpdir(), `codein-tidy-index-${process.pid}-${randomUUID()}`);
+  const env = { GIT_INDEX_FILE: scratch };
+  try {
+    // Start from a copy of the folder's own index: git's file-time cache means only changed files are hashed
+    // (an empty start hashed every file: 8 to 10 s per checkout). `add -A` then makes it equal the folder.
+    const own = git(['rev-parse', '--path-format=absolute', '--git-path', 'index'], top);
+    let copied = false;
+    if (own) { try { copyFileSync(own, scratch); copied = true; } catch {} }
+    if (!copied) {
+      const head = git(['rev-parse', '--verify', '--quiet', 'HEAD'], top);
+      if ((head ? git(['read-tree', head], top, env) : git(['read-tree', '--empty'], top, env)) === null) return null;
+    }
+    if (git(['add', '-A', '--', '.', ...excluded.map((dir) => `:(exclude)${dir}`)], top, env) === null) return null;
+    return git(['write-tree'], top, env);
+  } finally { fs.rm(scratch, { force: true }).catch(() => {}); }
+}
+
+/** Ignored files only this folder has: everything git ignores except rebuilt folders, agent state and leftovers. */
+async function ignoredToKeep(top, stateDirs) {
+  const raw = git(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], top, undefined, true) ?? '';
+  const skip = (rel) => rel.split('/').some((part) => REBUILT_DIRS.has(part) || AGENT_STATE_DIRS.includes(part)) || REBUILT_FILES.test(rel.split('/').pop())
+    || stateDirs.some((dir) => rel === dir || rel.startsWith(dir + '/')) || PROJECT_JUNK.some((rule) => rule.test(rel));
+  const files = [];
+  async function walk(rel) {
+    if (skip(rel)) return;
+    const full = join(top, rel), stat = await lstat(full);
+    if (!stat || stat.isSymbolicLink()) return;
+    if (stat.isDirectory()) { for (const name of await fs.readdir(full).catch(() => [])) await walk(`${rel}/${name}`); return; }
+    files.push({ rel, bytes: stat.size });
+  }
+  for (const entry of raw.split(String.fromCharCode(0)).filter(Boolean)) await walk(entry.replace(/\/$/, ''));
+  return files;
+}
+
+/** What saving a folder would do, without doing it. */
+export async function savePlan(path) {
+  const top = git(['rev-parse', '--show-toplevel'], path);
+  if (!top) throw new Error(`${path} is not inside a git worktree`);
+  const changes = classifyChanges(top);
+  const head = git(['rev-parse', '--verify', '--quiet', 'HEAD'], top);
+  const branch = git(['symbolic-ref', '--quiet', '--short', 'HEAD'], top) || null;
+  const tree = folderTree(top, changes.state);
+  if (!tree) throw new Error(`git could not read ${top}`);
+  const headTree = head ? git(['rev-parse', `${head}^{tree}`], top) : null;
+  const kept = head ? Boolean(git(['for-each-ref', '--count=1', '--contains', head, '--format=%(refname)', 'refs/heads', 'refs/remotes', 'refs/tags'], top)) : false;
+  const keep = await ignoredToKeep(top, changes.state);
+  const keepBytes = keep.reduce((sum, f) => sum + f.bytes, 0);
+  const tooBig = keep.filter((f) => f.bytes > KEEP_FILE_LIMIT).map((f) => f.rel);
+  return { top: resolve(top), head, branch, tree, headTree, changed: tree !== headTree, unreferenced: Boolean(head) && !kept,
+    work: changes.work.length, leftovers: changes.leftovers.length, state: changes.state, keep, keepBytes,
+    blocked: tooBig.length ? `ignored files too large to keep: ${tooBig.slice(0, 3).join(', ')}` : keepBytes > KEEP_TOTAL_LIMIT ? `ignored files to keep total ${size(keepBytes)}` : null };
+}
+
+/**
+ * Save a folder. Returns the saved record (also appended to ~/.codein-tidy/saved/index.jsonl), or
+ * { saved: false, reason } when there is nothing that exists only here. Never changes the folder.
+ */
+export async function saveFolder(path, options = {}) {
+  const now = options.now ?? Date.now();
+  const p = await savePlan(path);
+  if (p.blocked) return { saved: false, reason: p.blocked, top: p.top };
+  if (!p.changed && !p.unreferenced && !p.keep.length) return { saved: false, reason: 'nothing here that is not already in git', top: p.top };
+  const common = resolve(p.top, git(['rev-parse', '--git-common-dir'], p.top));
+  const name = basename(p.top), id = `${stampOf(now)}-${slug(name)}-${randomUUID().slice(0, 6)}`;
+  let snapshot = p.head;
+  if (p.changed || !p.head) {
+    const ident = { GIT_AUTHOR_NAME: 'codein-tidy', GIT_AUTHOR_EMAIL: 'codein-tidy@localhost', GIT_COMMITTER_NAME: 'codein-tidy', GIT_COMMITTER_EMAIL: 'codein-tidy@localhost' };
+    const message = `codein-tidy snapshot of ${p.top}${p.branch ? ` (branch ${p.branch})` : ''}\n\n${p.work} uncommitted change(s) saved on ${new Date(now).toISOString()}.`;
+    snapshot = git(['commit-tree', p.tree, ...(p.head ? ['-p', p.head] : []), '-m', message], p.top, ident);
+    if (!snapshot) throw new Error('git could not write the snapshot commit');
+  }
+  const ref = `refs/tidy/${slug(name)}/${id}`;
+  if (git(['update-ref', ref, snapshot], p.top) === null) throw new Error('git could not record the snapshot');
+  // Proof: the folder still equals what was saved (nothing changed while saving).
+  if (folderTree(p.top, p.state) !== p.tree) throw new Error('the folder changed while it was being saved; nothing was released, run again');
+  const keepDir = join(tidyHome(options), 'kept', id), kept = [];
+  for (const f of p.keep) {
+    const from = join(p.top, f.rel), to = join(keepDir, f.rel);
+    await fs.mkdir(join(to, '..'), { recursive: true });
+    await fs.copyFile(from, to);
+    const hash = await sha256(from);
+    if (hash !== await sha256(to)) throw new Error(`could not copy ${f.rel} exactly`);
+    kept.push({ rel: f.rel, bytes: f.bytes, sha256: hash });
+  }
+  if (kept.length) await fs.writeFile(join(keepDir, 'manifest.json'), JSON.stringify({ id, files: kept }, null, 2));
+  const bundle = await writeBundle(p.top, [ref], join(tidyHome(options), 'saved', `${slug(name)}-${id}.bundle`));
+  const record = { id, project: name, common, path: p.top, branch: p.branch, head: p.head, snapshot, tree: p.tree, ref, bundle,
+    kept: kept.length ? { dir: keepDir, files: kept.length, bytes: kept.reduce((s, f) => s + f.bytes, 0) } : null, work: p.work, savedAt: new Date(now).toISOString(),
+    restore: `npx codein-tidy restore ${id}` };
+  await fs.mkdir(join(tidyHome(options), 'saved'), { recursive: true });
+  await fs.appendFile(join(tidyHome(options), 'saved', 'index.jsonl'), JSON.stringify(record) + '\n');
+  return { saved: true, ...record };
+}
+
+/** One file holding the saved commits that exist nowhere else (commits already on a remote are left out). */
+async function writeBundle(top, refs, file) {
+  await fs.mkdir(join(file, '..'), { recursive: true });
+  const hasRemote = Boolean(git(['remote'], top));
+  const made = (hasRemote && git(['bundle', 'create', file, ...refs, '--not', '--remotes'], top) !== null) || git(['bundle', 'create', file, ...refs], top) !== null;
+  return made && git(['bundle', 'verify', file], top) !== null ? file : null;
+}
+
+export async function savedList(options = {}) {
+  const text = await fs.readFile(join(tidyHome(options), 'saved', 'index.jsonl'), 'utf8').catch(() => '');
+  return text.split('\n').filter(Boolean).map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean);
+}
+
+/** Put saved work back into a folder: the same branch (or commit), the same uncommitted changes, the kept files. */
+export async function restoreSaved(id, options = {}) {
+  const record = (await savedList(options)).find((r) => r.id === id);
+  if (!record) throw new Error(`no saved work with id ${id} (list them with: codein-tidy saved)`);
+  const to = resolve(options.to ?? record.path);
+  if (await lstat(to)) throw new Error(`${to} already exists; pass --to=<new folder>`);
+  if (git(['cat-file', '-e', `${record.snapshot}^{commit}`], record.common) === null) {
+    if (!record.bundle || git(['fetch', '--quiet', record.bundle, `${record.ref}:${record.ref}`], record.common) === null)
+      throw new Error('the snapshot is missing from the repository and its bundle could not be read');
+  }
+  const branchFree = record.branch && git(['rev-parse', '--verify', '--quiet', `refs/heads/${record.branch}`], record.common) === record.head
+    && !(git(['worktree', 'list', '--porcelain'], record.common) ?? '').split(/\r?\n/).includes(`branch refs/heads/${record.branch}`);
+  const base = record.head ?? record.snapshot;
+  if (git(['worktree', 'add', ...(branchFree ? [to, record.branch] : ['--detach', to, base])], record.common) === null) throw new Error(`git could not create ${to}`);
+  if (record.snapshot !== record.head && git(['restore', `--source=${record.snapshot}`, '--worktree', '--', '.'], to) === null)
+    throw new Error('git could not put the saved changes back');
+  if (record.kept) {
+    const manifest = JSON.parse(await fs.readFile(join(record.kept.dir, 'manifest.json'), 'utf8'));
+    for (const f of manifest.files) {
+      const target = join(to, f.rel);
+      await fs.mkdir(join(target, '..'), { recursive: true });
+      await fs.copyFile(join(record.kept.dir, f.rel), target);
+      if (await sha256(target) !== f.sha256) throw new Error(`kept file ${f.rel} did not restore exactly`);
+    }
+  }
+  const tree = folderTree(to, classifyChanges(to).state);
+  return { restored: tree === record.tree, path: to, branch: branchFree ? record.branch : null, tree, expected: record.tree };
+}
+
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
 export async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -849,9 +1010,45 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  if (!['report', 'clean', 'review', 'prepare', 'work'].includes(command) || (older && !(options.olderThanDays >= 1)) || (command === 'prepare' && !options.project)) {
-    console.error('Usage: codein-tidy [report | work [--all] [--notice] | review | prepare --project=PATH [--yes] | clean [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore'];
+  const positional = argv.filter((a) => !a.startsWith('--'));
+  if (!COMMANDS.includes(command) || (older && !(options.olderThanDays >= 1)) || (['prepare', 'save'].includes(command) && !options.project)
+      || (command === 'restore' && !positional[1])) {
+    console.error('Usage: codein-tidy [report | work [--all] [--notice] | save --project=PATH [--yes] | saved | restore ID [--to=PATH] | review | prepare --project=PATH [--yes] | clean [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');
     process.exitCode = 2; return;
+  }
+  if (command === 'save') {
+    if (!args.has('--yes')) {
+      const p = await savePlan(options.project);
+      const out = { folder: p.top, branch: p.branch, uncommittedChanges: p.work, leftovers: p.leftovers, commitsOnNoBranch: p.unreferenced,
+        localFilesToKeep: p.keep.map((f) => f.rel), blocked: p.blocked };
+      if (args.has('--json')) { console.log(JSON.stringify(out, null, 2)); return; }
+      console.log(`${p.top}${p.branch ? ` (branch ${p.branch})` : ' (no branch)'}`);
+      console.log(`  ${p.work} uncommitted change(s)${p.leftovers ? `, ${p.leftovers} agent leftover(s)` : ''}${p.unreferenced ? ', commits on no branch' : ''}.`);
+      console.log(`  Local files git ignores, to keep: ${p.keep.length ? p.keep.map((f) => f.rel).slice(0, 8).join(', ') : 'none'}.`);
+      console.log(p.blocked ? `  Cannot save: ${p.blocked}.` : '\nThis was a plan. Run again with --yes to save. The folder is never changed.');
+      return;
+    }
+    const result = await saveFolder(options.project);
+    if (args.has('--json')) { console.log(JSON.stringify(result, null, 2)); return; }
+    if (!result.saved) { console.log(`${result.top}: not saved: ${result.reason}.`); return; }
+    console.log(`Saved ${result.path} as ${result.id}.\n  Snapshot: ${result.ref}\n  Bundle: ${result.bundle ?? 'not written'}\n  Local files kept: ${result.kept ? `${result.kept.files} in ${result.kept.dir}` : 'none'}\n  Restore: ${result.restore}`);
+    return;
+  }
+  if (command === 'saved') {
+    const list = await savedList();
+    if (args.has('--json')) { console.log(JSON.stringify(list, null, 2)); return; }
+    if (!list.length) { console.log('Nothing saved yet.'); return; }
+    for (const r of list) console.log(`${r.id}  ${r.savedAt.slice(0, 10)}  ${r.branch ?? '(no branch)'}  ${r.work} change(s)  ${r.path}`);
+    return;
+  }
+  if (command === 'restore') {
+    const to = argv.find((a) => a.startsWith('--to='));
+    const result = await restoreSaved(positional[1], to ? { to: to.slice(5) } : {});
+    console.log(result.restored ? `Restored to ${result.path}${result.branch ? ` on branch ${result.branch}` : ''}; it matches what was saved.`
+      : `Restored to ${result.path}, but it does not match what was saved (tree ${result.tree}, expected ${result.expected}). Check it before using it.`);
+    if (!result.restored) process.exitCode = 1;
+    return;
   }
   if (command === 'work') {
     if (args.has('--notice')) {

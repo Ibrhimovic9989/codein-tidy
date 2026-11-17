@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -536,8 +536,64 @@ test('work --notice prints nothing outside a git project and never fails', async
 
 test('the plugin carries the same tool its session-start hook runs', async () => {
   const { readFile } = await import('node:fs/promises');
-  assert.equal(await readFile(join(process.cwd(), 'plugins', 'codein-tidy', 'scripts', 'tidy.mjs'), 'utf8'), await readFile(join(process.cwd(), 'tidy.mjs'), 'utf8'),
-    'plugins/codein-tidy/scripts/tidy.mjs is stale: copy tidy.mjs over it');
+  const { createHash } = await import('node:crypto');
+  const hash = async (p) => createHash('sha256').update(await readFile(join(process.cwd(), ...p))).digest('hex');
+  assert.equal(await hash(['plugins', 'codein-tidy', 'scripts', 'tidy.mjs']), await hash(['tidy.mjs']), 'plugins/codein-tidy/scripts/tidy.mjs is stale: copy tidy.mjs over it');
   const hooks = JSON.parse(await readFile(join(process.cwd(), 'plugins', 'codein-tidy', 'hooks', 'claude-code.json'), 'utf8'));
   assert.match(hooks.hooks.SessionStart[0].hooks[0].command, /scripts\/tidy\.mjs" work --notice$/);
+});
+
+test('save then restore gives back the exact folder: changes, deletions, new files, local env file, no-branch commits', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), 'node_modules/\n.env.local\ndist/\n'); await writeFile(join(repo, 'b.txt'), 'b');
+  g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const tree = join(m.root, 'wt', 'feature');
+  g(['worktree', 'add', '-q', '--detach', tree, 'main'], repo);
+  await writeFile(join(tree, 'local.txt'), 'commit on no branch'); g(['add', '.'], tree); g(['commit', '-q', '-m', 'local'], tree);
+  await writeFile(join(tree, 'a.txt'), 'changed'); await (await import('node:fs/promises')).rm(join(tree, 'b.txt'));
+  await writeFile(join(tree, 'new.js'), 'new'); await writeFile(join(tree, '.env.local'), 'SECRET=only-here');
+  await aged(join(tree, 'node_modules', 'pkg', 'index.js'), 0); await aged(join(tree, 'dist', 'app.js'), 0);
+  await aged(join(tree, '.code-in', 'state', 'x.json'), 0);
+
+  const plan = await savePlan(tree);
+  assert.deepEqual([plan.changed, plan.unreferenced, plan.keep.map((f) => f.rel)], [true, true, ['.env.local']]);
+  const saved = await saveFolder(tree, { home: m.home });
+  assert.equal(saved.saved, true);
+  assert.ok(saved.bundle && await exists(saved.bundle));
+  assert.equal(saved.kept.files, 1);
+  assert.equal((await savedList({ home: m.home })).length, 1);
+  assert.match(g(['log', '-1', '--format=%an %s', saved.ref], repo), /^codein-tidy codein-tidy snapshot of/);
+  assert.equal(g(['status', '--porcelain'], tree).includes('new.js'), true, 'the folder itself is untouched');
+
+  g(['worktree', 'remove', '--force', tree], repo);
+  assert.equal(await exists(tree), false);
+  const back = await restoreSaved(saved.id, { home: m.home });
+  assert.equal(back.restored, true, JSON.stringify(back));
+  const { readFile } = await import('node:fs/promises');
+  assert.equal(await readFile(join(tree, 'a.txt'), 'utf8'), 'changed');
+  assert.equal(await exists(join(tree, 'b.txt')), false);
+  assert.equal(await readFile(join(tree, 'new.js'), 'utf8'), 'new');
+  assert.equal(await readFile(join(tree, '.env.local'), 'utf8'), 'SECRET=only-here');
+  assert.equal(await readFile(join(tree, 'local.txt'), 'utf8'), 'commit on no branch');
+  assert.ok(g(['status', '--porcelain'], tree).includes('M a.txt'), 'the changes are uncommitted again, as they were');
+});
+
+test('save: a branch comes back on its branch; a clean folder needs no save; too-large local files block it', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const tree = join(m.root, 'wt', 'topic');
+  g(['worktree', 'add', '-q', '-b', 'topic', tree], repo);
+  assert.deepEqual([(await saveFolder(tree, { home: m.home })).saved], [false], 'nothing unsaved in a clean pushed folder');
+  await writeFile(join(tree, 'wip.txt'), 'wip');
+  const saved = await saveFolder(tree, { home: m.home });
+  g(['worktree', 'remove', '--force', tree], repo);
+  const back = await restoreSaved(saved.id, { home: m.home });
+  assert.deepEqual([back.restored, back.branch], [true, 'topic']);
+
+  await writeFile(join(repo, '.gitignore'), 'big.bin\n');
+  const { open } = await import('node:fs/promises');
+  const handle = await open(join(repo, 'big.bin'), 'w'); await handle.truncate(21 * 1024 * 1024); await handle.close();
+  const blocked = await saveFolder(repo, { home: m.home });
+  assert.equal(blocked.saved, false); assert.match(blocked.reason, /too large to keep: big\.bin/);
 });
