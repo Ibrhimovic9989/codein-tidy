@@ -10,27 +10,30 @@ This skill measures them and removes only what is safe.
 
 ## Steps
 
-1. Run the report. It only reads:
+One command does the whole job. You show the person the list; they choose; you apply their choice.
+
+1. Run it. It only reads, and prints a review list: every item with a name, its size and what will happen.
 
    ```
-   npx -y codein-tidy@latest report
+   npx -y codein-tidy@latest
    ```
 
-2. Show the user the report as it printed. Name the biggest items and what "can be freed" means.
+2. Show the person the list as it printed. Items marked [x] are suggested; `history` deletes old chats for good,
+   so it is never suggested. Idle worktrees are saved (a snapshot commit of their work plus ignored local files,
+   in one file per project) before they are removed.
 
-3. Ask the user before removing anything. Then show the plan:
+3. Ask which items to free. Wait for the answer. Never choose for them.
 
-   ```
-   npx -y codein-tidy@latest clean
-   ```
-
-4. Only after the user agrees to that plan, run it:
+4. Run their choice, by name (or `suggested`, or `all`):
 
    ```
-   npx -y codein-tidy@latest clean --yes
+   npx -y codein-tidy@latest --apply=worktrees:my-app,caches,cleanup:claude-code
    ```
 
-5. Report the "Removed ... freed" line exactly as printed, and any item it could not remove.
+   It scans again before acting and skips anything that changed.
+
+5. Report the "Done. About ... freed" line exactly as printed, where the saved work is, and any item it kept.
+   `codein-tidy saved` lists saved work; `codein-tidy restore <id>` puts a folder back exactly.
 
 ## Unfinished work
 

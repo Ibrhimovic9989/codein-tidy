@@ -6,10 +6,19 @@ most of them never delete any of it. `codein-tidy` shows where your disk went an
 Works with **Claude Code, Codex, Cursor and Antigravity** on Windows, macOS and Linux. No dependencies.
 
 ```
-npx codein-tidy            # report: reads only
+npx codein-tidy            # one command: review everything, choose, confirm once, done
+```
+
+In a terminal it scans everything, shows one list (each item with its size and what will happen), lets you keep
+the suggested selection, select all, or switch items by number, asks yes or no once, then does it: every idle
+worktree's work is saved into one file per project before the folder is removed, then caches, logs and leftovers
+are freed. Through an agent (no terminal) the same list is printed with a name per item; the agent shows it to
+you and runs your choice with `npx codein-tidy --apply=<names>` (or `--apply=suggested`, `--apply=all`).
+
+```
 npx codein-tidy work       # unfinished work in this project, from every tool: reads only
-npx codein-tidy clean      # shows the plan, removes nothing
-npx codein-tidy clean --yes
+npx codein-tidy report     # the detailed report: reads only
+npx codein-tidy clean      # the older step-by-step: shows the plan, removes nothing (add --yes)
 ```
 
 ## Unfinished work

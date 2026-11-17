@@ -1026,7 +1026,10 @@ async function closeLeftovers(options = {}) {
       const listed = linkedWorktreesAll(r.common);
       if ([listed.main, ...listed.linked.map((w) => w.path)].some((p) => resolve(p) === resolve(r.path))) continue;
     } catch { continue; }
-    out.push({ project: r.project, common: r.common, path: r.path, branch: r.branch, stage: 'leftover', savedId: r.id, idleDays: 0, keep: null, leftover: true });
+    // The project is the repository's main checkout, not the worktree folder's own name.
+    let project = r.project;
+    try { project = basename(linkedWorktreesAll(r.common).main); } catch {}
+    out.push({ project, common: r.common, path: r.path, branch: r.branch, stage: 'leftover', savedId: r.id, idleDays: 0, keep: null, leftover: true });
   }
   return out;
 }
@@ -1473,6 +1476,126 @@ export async function guardUninstall(options = {}) {
   return { removed: true };
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Guided: `npx codein-tidy` in a terminal does the whole job in one command. It scans everything, shows one review
+// list (each item with its size and what will happen), lets the person keep the suggested selection, select all,
+// or switch items by number, asks yes or no once, then saves every folder's work into one file per project, and
+// frees the rest. Without a terminal (an agent, a script) the command only reports, as before.
+// ---------------------------------------------------------------------------------------------------------------
+const sumFree = (list) => list.reduce((s, x) => s + (x.freeable ?? 0), 0);
+const planFree = (p) => p.removable.reduce((s, e) => s + (e.freeable ?? 0), 0);
+
+export async function guidedPlan(options = {}) {
+  const cwd = resolve(options.cwd ?? process.cwd());
+  const now = options.now ?? Date.now();
+  const scanned = await scan({ ...options, cwd, history: true, caches: true, worktrees: false });
+  const items = [], notes = [];
+  const close = await closePlan({ ...options, cwd, all: true, now });
+  const groups = new Map();
+  for (const x of close.candidates) { const key = x.project ?? basename(x.common ?? x.path); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(x); }
+  for (const [project, list] of groups) {
+    const work = list.filter((x) => ['uncommitted', 'not pushed', 'no remote'].includes(x.stage)).length;
+    items.push({ key: `worktrees:${slug(project)}`, kind: 'close', selected: true, bytes: sumFree(list), close: list,
+      label: `Idle worktrees of ${project} (${list.length}): save their work${work ? ` (${work} hold unfinished work)` : ''}, then remove`,
+      detail: list.map((x) => `${x.path}  ${x.branch ?? '(no branch)'}  ${x.leftover ? 'already saved' : x.stage}`) });
+  }
+  const others = scanned.filter((p) => p.kind !== 'worktrees' && p.kind !== 'report');
+  for (const p of others.filter((p) => p.skipped && /running/.test(p.skipped))) notes.push(`${p.tool}: ${p.item} skipped (${p.skipped})`);
+  const ready = others.filter((p) => !p.skipped && p.removable.length && planFree(p) > 0);
+  const byTool = new Map();
+  for (const p of ready.filter((p) => p.class !== 'history' && p.tool !== 'Package caches')) { if (!byTool.has(p.tool)) byTool.set(p.tool, []); byTool.get(p.tool).push(p); }
+  for (const [tool, plans] of byTool)
+    items.push({ key: `cleanup:${slug(tool).toLowerCase()}`, kind: 'clean', selected: true, bytes: plans.reduce((s, p) => s + planFree(p), 0), plans,
+      label: `${tool}: ${plans.map((p) => p.item.toLowerCase()).join(', ')} past their age limit`, detail: plans.map((p) => `${size(planFree(p)).padStart(8)}  ${p.item}`) });
+  const caches = ready.filter((p) => p.tool === 'Package caches');
+  if (caches.length) items.push({ key: 'caches', kind: 'clean', selected: true, bytes: caches.reduce((s, p) => s + planFree(p), 0), plans: caches,
+    label: 'Package caches: they download again when needed', detail: caches.map((p) => `${size(planFree(p)).padStart(8)}  ${p.item}`) });
+  const history = ready.filter((p) => p.class === 'history');
+  if (history.length) items.push({ key: 'history', kind: 'clean', selected: false, bytes: history.reduce((s, p) => s + planFree(p), 0), plans: history,
+    label: 'Old chat history and edit history (30 days and older): deleted for good', detail: history.map((p) => `${size(planFree(p)).padStart(8)}  ${p.tool}: ${p.item}`) });
+  const junk = git(['rev-parse', '--show-toplevel'], cwd) ? await projectPlans(cwd, { ...options, now }) : [];
+  const trash = junk.filter((p) => p.kind === 'trash');
+  if (trash.length) items.push({ key: 'leftovers', kind: 'clean', selected: true, bytes: trash.reduce((s, p) => s + p.bytes, 0), plans: trash,
+    label: `Agent leftovers in this project (screenshots, temp scripts): to trash, emptied after ${TRASH_DAYS} days`, detail: trash.map((p) => `${p.files} file(s)  ${p.item}`) });
+  items.sort((a, b) => Number(b.selected) - Number(a.selected) || b.bytes - a.bytes);
+  return { items, notes, kept: close.folders.filter((x) => x.keep), at: now };
+}
+
+export function formatGuided(plan) {
+  const total = plan.items.reduce((s, i) => s + i.bytes, 0), chosen = plan.items.filter((i) => i.selected).reduce((s, i) => s + i.bytes, 0);
+  const lines = [`codein-tidy found ${size(total)} you can get back.`, ''];
+  plan.items.forEach((item, n) => lines.push(`  [${item.selected ? 'x' : ' '}] ${String(n + 1).padStart(2)}  ${size(item.bytes).padStart(8)}  ${item.label}`));
+  if (plan.kept.length) lines.push('', `Kept as they are (${plan.kept.length}): ${plan.kept.slice(0, 3).map((k) => `${k.branch ?? basename(k.path)} (${k.keep})`).join(', ')}${plan.kept.length > 3 ? ', ...' : ''}`);
+  for (const note of plan.notes) lines.push(`Note: ${note}`);
+  lines.push('', `Selected: ${size(chosen)}.`);
+  return lines.join('\n');
+}
+
+/** Do the chosen items: worktrees first (work saved into one file per project), then caches, logs and leftovers. */
+export async function applyItems(plan, chosen, options = {}, say = () => {}) {
+  const receipt = { freed: 0, saved: 0, bundles: [], failed: [], moved: 0, trash: undefined };
+  const close = chosen.filter((i) => i.kind === 'close').flatMap((i) => i.close);
+  if (close.length) {
+    say(`Saving the work of ${close.length} folder(s), then removing them...`);
+    const r = await closeFolders({ candidates: close, at: plan.at }, options);
+    receipt.freed += r.freed; receipt.saved += r.saved.length; receipt.bundles.push(...r.bundles); receipt.failed.push(...r.failed);
+  }
+  const plans = chosen.filter((i) => i.kind === 'clean').flatMap((i) => i.plans);
+  if (plans.length) {
+    say('Freeing caches, logs and leftovers...');
+    const r = await clean(plans, plan.at, options.runner ? { runner: options.runner } : {});
+    receipt.freed += r.bytes + r.movedBytes; receipt.moved += r.moved; receipt.trash = r.trash; receipt.failed.push(...r.failed);
+  }
+  say('');
+  say(`Done. About ${size(receipt.freed)} freed.${receipt.saved ? ` Work from ${receipt.saved} folder(s) saved in:` : ''}`);
+  for (const b of receipt.bundles) say(`  ${b}`);
+  if (receipt.saved) say('  List saved work: codein-tidy saved. Put a folder back: codein-tidy restore <id>.');
+  if (receipt.moved) say(`  ${receipt.moved} project leftover(s) moved to ${receipt.trash}; deleted after ${TRASH_DAYS} days.`);
+  for (const f of receipt.failed) say(`  kept ${f.path}: ${f.error}`);
+  return receipt;
+}
+
+/** The same review for an agent: every item with its name, and how to hand the person's choice back. */
+export function formatForAgent(plan) {
+  if (!plan.items.length) return 'codein-tidy: nothing to free; everything is in use or still recent.';
+  const width = Math.max(...plan.items.map((i) => i.key.length)) + 2;
+  const lines = [formatGuided(plan).replace(/^( +\[[ x]\] +(\d+)) +/gm, (whole, lead, n) => `${lead}  ${plan.items[Number(n) - 1].key.padEnd(width)}`), ''];
+  lines.push('To the agent: show this list to the person and ask which items to free ([x] are suggested; history is deleted for good).',
+    'Then run, with their choice: npx -y codein-tidy@latest --apply=<names, comma separated> (or --apply=suggested, or --apply=all).',
+    'Never run --apply without the person\'s answer. Worktrees are saved before they are removed; codein-tidy restore <id> puts one back.');
+  return lines.join('\n');
+}
+
+/** Ask, then do. `input`/`output` are streams (a terminal, or a test's). Returns what was done. */
+export async function guidedRun({ input = process.stdin, output = process.stdout, options = {} } = {}) {
+  const { createInterface } = await import('node:readline');
+  const rl = createInterface({ input, output, terminal: false });
+  const lines = rl[Symbol.asyncIterator]();
+  const ask = async (prompt) => { output.write(prompt); const next = await lines.next(); return next.done ? 'q' : String(next.value).trim(); };
+  const say = (text) => output.write(text + '\n');
+  try {
+    say('Looking at everything AI coding tools left on this machine. This reads only...');
+    const plan = await guidedPlan(options);
+    if (!plan.items.length) { say('Nothing to free: everything is in use or still recent.'); return { done: false }; }
+    for (;;) {
+      say(''); say(formatGuided(plan));
+      const answer = (await ask('Enter: go on with the selected items. a: all. n: none. Numbers (2 5): switch items. d 1: details. q: quit.\n> ')).toLowerCase();
+      if (answer === 'q') { say('Nothing was changed.'); return { done: false }; }
+      if (answer === 'a') { plan.items.forEach((i) => { i.selected = true; }); continue; }
+      if (answer === 'n') { plan.items.forEach((i) => { i.selected = false; }); continue; }
+      const detail = /^d\s*(\d+)$/.exec(answer);
+      if (detail) { const item = plan.items[Number(detail[1]) - 1]; if (item) { say(''); say(item.label); item.detail.forEach((d) => say(`    ${d}`)); } continue; }
+      if (answer) { for (const n of answer.split(/[\s,]+/).map(Number)) if (plan.items[n - 1]) plan.items[n - 1].selected = !plan.items[n - 1].selected; continue; }
+      const chosen = plan.items.filter((i) => i.selected);
+      if (!chosen.length) { say('Nothing is selected.'); continue; }
+      const folders = chosen.filter((i) => i.kind === 'close').reduce((n, i) => n + i.close.length, 0);
+      const yes = (await ask(`\n${folders ? `Save the work of ${folders} folder(s) into one file per project, then free` : 'Free'} about ${size(chosen.reduce((s, i) => s + i.bytes, 0))}? (y/n) `)).toLowerCase();
+      if (yes !== 'y' && yes !== 'yes') { say('Nothing was changed.'); return { done: false }; }
+      return { done: true, receipt: await applyItems(plan, chosen, options, say) };
+    }
+  } finally { rl.close(); }
+}
+
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
 export async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -1485,6 +1608,29 @@ export async function main(argv) {
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
   const positional = argv.filter((a) => !a.startsWith('--'));
   const value = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : undefined; };
+  // The bare command does the whole job. A person in a terminal reviews and confirms once. An agent gets the same
+  // review as text (or --json) to show the person, then hands their choice back with --apply.
+  const apply = value('apply');
+  if (!positional.length && !args.has('--report')) {
+    if (apply === undefined && !args.has('--json') && process.stdin.isTTY && process.stdout.isTTY) {
+      await guidedRun({ options });
+      console.log('\nKeep your disk free automatically: code.in cleans up after itself. https://code.in');
+      return;
+    }
+    const plan = await guidedPlan(options);
+    if (apply === undefined) {
+      console.log(args.has('--json') ? JSON.stringify(plan.items.map(({ key, label, bytes, selected, detail }) => ({ key, label, bytes, suggested: selected, detail })), null, 2) : formatForAgent(plan));
+      return;
+    }
+    const names = apply.split(',').map((n) => n.trim()).filter(Boolean);
+    const chosen = names.includes('all') ? plan.items : names.includes('suggested') ? plan.items.filter((i) => i.selected) : plan.items.filter((i) => names.includes(i.key));
+    const unknown = names.filter((n) => !['all', 'suggested'].includes(n) && !plan.items.some((i) => i.key === n));
+    if (unknown.length) console.log(`Not found now (in use, already freed, or never there): ${unknown.join(', ')}.`);
+    if (!chosen.length) { console.log('Nothing to do.'); return; }
+    const receipt = await applyItems(plan, chosen, options, (line) => console.log(line));
+    if (args.has('--json')) console.log(JSON.stringify(receipt));
+    return;
+  }
   const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps', 'guard'];
   if (command === 'guard') {
     const mode = value('mode') ?? 'notify';

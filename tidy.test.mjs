@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -866,4 +866,80 @@ test('close finishes a folder git dropped but could not delete (Windows: path to
   const r3 = await closeFolders(await closePlan({ ...m.options, cwd: repo, home: m.home, now: Date.now() + 3 * DAY }), { home: m.home });
   assert.deepEqual(r3.failed, []);
   assert.equal(await exists(c), false);
+});
+
+test('guided: one command scans, shows a review list, takes a selection and one yes, saves work, frees space', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const idle = join(m.root, 'wt', 'idle');
+  g(['worktree', 'add', '-q', '-b', 'idle', idle], repo);
+  await writeFile(join(idle, 'half.js'), 'unfinished');
+  await ageTree(idle, 5);
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old.sh'), 10);
+  await aged(join(m.home, '.codex', 'archived_sessions', 'old.jsonl'), 90);
+  await aged(join(repo, '.tmp-probe.py'), 10);
+  const { PassThrough } = await import('node:stream');
+  const run = async (answers) => {
+    const input = new PassThrough(), output = new PassThrough(); let text = '';
+    output.on('data', (d) => { text += d; });
+    const done = guidedRun({ input, output, options: { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY } });
+    for (const a of answers) input.write(a + '\n');
+    input.end();
+    return { result: await done, text };
+  };
+
+  // Quit changes nothing; the list shows each item with its size, history is not preselected.
+  const quit = await run(['q']);
+  assert.equal(quit.result.done, false);
+  assert.match(quit.text, /\[x\] +\d+ +.*Idle worktrees of app \(1\): save their work \(1 hold unfinished work\), then remove/);
+  assert.match(quit.text, /\[ \] +\d+ +.*Old chat history/);
+  assert.match(quit.text, /\[x\] +\d+ +.*Agent leftovers in this project/);
+  assert.equal(await exists(idle), true);
+
+  // Details, then go with the suggestion, then yes. (Items are sorted by size: find the worktrees' number.)
+  const n = /\[x\] +(\d+) +\S+ \S+ +Idle worktrees/.exec(quit.text)[1];
+  const go = await run([`d ${n}`, '', 'y']);
+  assert.equal(go.result.done, true, go.text);
+  assert.ok(go.text.includes(idle), 'the details list the folder');
+  assert.equal(await exists(idle), false, 'the idle worktree is gone');
+  assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old.sh')), false, 'old snapshots freed');
+  assert.equal(await exists(join(m.home, '.codex', 'archived_sessions', 'old.jsonl')), true, 'history kept: not selected');
+  assert.equal(await exists(join(repo, '.tmp-probe.py')), false, 'leftover moved to trash');
+  assert.match(go.text, /Done\. About .* freed\. Work from 1 folder\(s\) saved in:/);
+  const [saved] = await savedList({ home: m.home });
+  const back = await restoreSaved(saved.id, { home: m.home });
+  assert.equal(back.restored, true);
+
+  // Switching an item by number, then answering no, changes nothing.
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old2.sh'), 10);
+  const no = await run(['', 'n']);
+  assert.equal(no.result.done, false);
+  assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old2.sh')), true);
+});
+
+test('guided for an agent: the bare command lists named items and how to apply; --apply does only what was named', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const idle = join(m.root, 'wt', 'idle');
+  g(['worktree', 'add', '-q', '-b', 'idle', idle], repo);
+  await writeFile(join(idle, 'half.js'), 'unfinished');
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old.sh'), 10);
+  const local = join(m.root, 'local'), roaming = join(m.root, 'roaming');
+  const env = { ...process.env, HOME: m.home, USERPROFILE: m.home, TEMP: m.temp, TMP: m.temp, TMPDIR: m.temp, APPDATA: roaming, LOCALAPPDATA: local,
+    XDG_CONFIG_HOME: m.config, XDG_CACHE_HOME: join(m.root, 'xdg-cache'), CLAUDE_CONFIG_DIR: join(m.home, '.claude'), CODEX_HOME: join(m.home, '.codex'),
+    PLAYWRIGHT_BROWSERS_PATH: join(local, 'ms-playwright'), npm_config_cache: join(m.root, 'npm-cache'), CODEIN_TIDY_PROFILE: '' };
+  const run = (...args) => spawnSync(process.execPath, [join(process.cwd(), 'tidy.mjs'), ...args], { cwd: repo, env, encoding: 'utf8', input: '' });
+  const listed = run();
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.match(listed.stdout, /cleanup:claude-code/);
+  assert.match(listed.stdout, /Never run --apply without the person's answer/);
+  const json = JSON.parse(run('--json').stdout);
+  assert.ok(json.some((i) => i.key === 'cleanup:claude-code' && i.suggested === true));
+  // The worktree is used today (just made), so it is not offered; the named item alone is done.
+  const applied = run('--apply=cleanup:claude-code,history');
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.match(applied.stdout, /Not found now .*history/);
+  assert.match(applied.stdout, /Done\. About .* freed\./);
+  assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old.sh')), false);
+  assert.equal(await exists(join(idle, 'half.js')), true, 'nothing that was not named');
 });
