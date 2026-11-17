@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -659,4 +659,34 @@ test('clean --worktrees keeps a copy of ignored local files before git deletes t
   const [record] = await savedList({ home: m.home });
   const { readFile } = await import('node:fs/promises');
   assert.equal(await readFile(join(record.kept.dir, '.env.local'), 'utf8'), 'TOKEN=only-copy');
+});
+
+test('slots: a budget of working folders, reused across tasks; work left in a slot is saved before reuse', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.codein-tidy.json'), JSON.stringify({ budget: 2 }));
+  await writeFile(join(repo, '.git', 'info', 'exclude'), '.codein-tidy.json\nnode_modules/\n');
+  const opts = { ...m.options, cwd: repo, home: m.home };
+  const a = await takeSlot({ ...opts, branch: 'task-a', holder: 'claude' });
+  const b = await takeSlot({ ...opts, branch: 'task-b', holder: 'codex' });
+  assert.deepEqual([a.created, b.created, basename(a.path), basename(b.path)], [true, true, '1', '2']);
+  assert.equal(a.path, join(`${repo}.slots`, '1'));
+  await assert.rejects(takeSlot({ ...opts, branch: 'task-c' }), (e) => e.code === 'OVER_BUDGET' && /budget is 2/.test(e.message));
+
+  // Task A ends with unfinished work and installed dependencies in its slot.
+  await writeFile(join(a.path, 'half.js'), 'half done'); await aged(join(a.path, 'node_modules', 'dep', 'i.js'), 0);
+  const released = await releaseSlot({ ...opts, path: a.path });
+  assert.ok(released.savedId);
+  const c = await takeSlot({ ...opts, branch: 'task-c', holder: 'claude' });
+  assert.deepEqual([c.reused, c.path], [true, a.path]);
+  assert.equal(g(['branch', '--show-current'], c.path), 'task-c');
+  assert.equal(await exists(join(c.path, 'half.js')), false, 'the slot is clean for the new task');
+  assert.equal(await exists(join(c.path, 'node_modules', 'dep', 'i.js')), true, 'installed dependencies stay');
+  assert.equal(g(['worktree', 'list'], repo).split('\n').length, 3, 'still two slots plus the main checkout');
+
+  // The unfinished work of task A is saved and comes back on its branch.
+  const back = await restoreSaved(released.savedId, { home: m.home, to: join(m.root, 'restored-a') });
+  assert.deepEqual([back.restored, back.branch], [true, 'task-a']);
+  const [listed] = await listSlots({ home: m.home });
+  assert.deepEqual(listed.slots.map((s) => [s.branch, s.state, s.holder]), [['task-c', 'in use', 'claude'], ['task-b', 'in use', 'codex']]);
 });

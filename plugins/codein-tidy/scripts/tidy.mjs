@@ -1076,6 +1076,133 @@ export async function restoreSaved(id, options = {}) {
   return { restored: tree === record.tree, path: to, branch: branchFree ? record.branch : null, tree, expected: record.tree };
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Slots: a project gets a small, fixed pool of working folders (its budget, default 3, or "budget" in
+// .codein-tidy.json), kept beside the main checkout in <project>.slots/<n>. A task takes a free slot and switches
+// branch inside it, as a person would; installed dependencies stay. A new folder is made only while the project
+// is under budget. Work left in a slot is saved before the slot is reused. Registry: ~/.codein-tidy/slots.json.
+// ---------------------------------------------------------------------------------------------------------------
+export const DEFAULT_BUDGET = 3;
+
+async function projectConfig(main) {
+  try { return JSON.parse(await fs.readFile(join(main, '.codein-tidy.json'), 'utf8')); } catch { return {}; }
+}
+export async function projectBudget(main) {
+  const n = Number((await projectConfig(main)).budget);
+  return Number.isInteger(n) && n >= 1 ? n : DEFAULT_BUDGET;
+}
+
+function projectOf(path) {
+  const commonRaw = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], path);
+  if (!commonRaw) throw new Error(`${path} is not inside a git project`);
+  const common = resolve(commonRaw);
+  const listed = linkedWorktreesAll(common);
+  return { common, main: listed.main, linked: listed.linked };
+}
+/** All worktrees of a repository, including missing ones git still lists (they count toward the budget). */
+function linkedWorktreesAll(common) {
+  const blocks = (git(['worktree', 'list', '--porcelain'], common) ?? '').split(/\r?\n\r?\n/).map((b) => b.split(/\r?\n/))
+    .filter((l) => l[0]?.startsWith('worktree ') && !l.includes('bare'));
+  return { main: resolve(blocks[0][0].slice(9)), linked: blocks.slice(1).map((l) => ({ path: resolve(l[0].slice(9)),
+    branch: (l.find((x) => x.startsWith('branch ')) ?? '').replace('branch refs/heads/', '') || null, locked: l.some((x) => x.startsWith('locked')) })) };
+}
+
+async function withRegistry(options, change) {
+  const dir = tidyHome(options), file = join(dir, 'slots.json'), lock = join(dir, 'slots.lock');
+  await fs.mkdir(dir, { recursive: true });
+  let handle;
+  for (let attempt = 0; ; attempt++) {
+    try { handle = await fs.open(lock, 'wx'); break; } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      const stat = await lstat(lock);
+      if (stat && Date.now() - stat.mtimeMs > 60_000) { await fs.rm(lock, { force: true }); continue; } // a crashed holder
+      if (attempt > 200) throw new Error('the slot registry is busy; try again');
+      await new Promise((done) => setTimeout(done, 50));
+    }
+  }
+  try {
+    const registry = JSON.parse(await fs.readFile(file, 'utf8').catch(() => '{"projects":{}}'));
+    const result = await change(registry);
+    await fs.writeFile(file + '.tmp', JSON.stringify(registry, null, 2));
+    await fs.rename(file + '.tmp', file);
+    return result;
+  } finally { await handle.close(); await fs.rm(lock, { force: true }); }
+}
+
+/** Switch a clean folder to a branch: the local one, else the remote one, else a new one from base. */
+function switchBranch(path, branch, base) {
+  if (git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], path)) return git(['switch', '--quiet', branch], path) !== null;
+  if (git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], path)) return git(['switch', '--quiet', '-c', branch, '--track', `origin/${branch}`], path) !== null;
+  return git(['switch', '--quiet', '-c', branch, ...(base ? [base] : [])], path) !== null;
+}
+
+export async function takeSlot(options) {
+  const { branch, holder = 'agent', base } = options;
+  if (!branch || !/^[\w./-]+$/.test(branch)) throw new Error('--branch=<name> is required');
+  const p = projectOf(options.project ?? options.cwd ?? process.cwd());
+  const budget = await projectBudget(p.main);
+  const busy = p.linked.find((w) => w.branch === branch);
+  return withRegistry(options, async (registry) => {
+    const entry = (registry.projects[p.common] ??= { main: p.main, slots: [] });
+    entry.slots = entry.slots.filter((s) => p.linked.some((w) => w.path === s.path)); // forget slots git no longer lists
+    if (busy) {
+      const mine = entry.slots.find((s) => s.path === busy.path);
+      if (mine && mine.state === 'idle') { Object.assign(mine, { state: 'in use', holder, since: new Date().toISOString() }); return { path: busy.path, branch, reused: true, created: false }; }
+      throw new Error(`branch ${branch} is already checked out in ${busy.path}`);
+    }
+    const free = entry.slots.find((s) => s.state === 'idle');
+    if (free) {
+      const plan = await savePlan(free.path);
+      let saved = null;
+      if (plan.changed || plan.unreferenced || plan.keep.length) {
+        saved = await saveFolder(free.path, options);
+        if (!saved.saved) throw new Error(`slot ${free.path} holds work that could not be saved: ${saved.reason}`);
+      }
+      // Saved and proven: the slot may be cleaned. Ignored files (installed dependencies) stay.
+      if (plan.changed && (git(['reset', '--hard', '--quiet'], free.path) === null || git(['clean', '-fdq'], free.path) === null)) throw new Error(`could not clean slot ${free.path}`);
+      if (!switchBranch(free.path, branch, base)) throw new Error(`could not switch ${free.path} to ${branch}`);
+      Object.assign(free, { state: 'in use', holder, branch, since: new Date().toISOString() });
+      return { path: free.path, branch, reused: true, created: false, savedFirst: saved?.id ?? null };
+    }
+    if (p.linked.length >= budget) {
+      const err = new Error(`${basename(p.main)} already has ${p.linked.length} worktree(s), its budget is ${budget}. ` +
+        'Release a slot you finished (codein-tidy slot release), or close idle worktrees (codein-tidy close), then take one again.');
+      err.code = 'OVER_BUDGET'; throw err;
+    }
+    const root = `${p.main}.slots`;
+    let n = 1; while (p.linked.some((w) => w.path === join(root, String(n))) || await lstat(join(root, String(n)))) n += 1;
+    const path = join(root, String(n));
+    await fs.mkdir(root, { recursive: true });
+    const exists = git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], p.main);
+    const remote = !exists && git(['rev-parse', '--verify', '--quiet', `refs/remotes/origin/${branch}`], p.main);
+    const args = exists ? ['worktree', 'add', '--quiet', path, branch] : remote ? ['worktree', 'add', '--quiet', '--track', '-b', branch, path, `origin/${branch}`]
+      : ['worktree', 'add', '--quiet', '-b', branch, path, ...(base ? [base] : [])];
+    if (git(args, p.main) === null) throw new Error(`git could not create ${path}`);
+    entry.slots.push({ path: resolve(path), state: 'in use', holder, branch, since: new Date().toISOString() });
+    return { path: resolve(path), branch, reused: false, created: true };
+  });
+}
+
+export async function releaseSlot(options) {
+  const path = resolve(options.path ?? options.cwd ?? process.cwd());
+  const top = resolve(git(['rev-parse', '--show-toplevel'], path) ?? path);
+  const p = projectOf(top);
+  return withRegistry(options, async (registry) => {
+    const slot = registry.projects[p.common]?.slots.find((s) => s.path === top);
+    if (!slot) throw new Error(`${top} is not a slot (take one with: codein-tidy slot take --branch=<name>)`);
+    const plan = await savePlan(top);
+    const saved = plan.changed || plan.unreferenced || plan.keep.length ? await saveFolder(top, options) : null;
+    if (saved && !saved.saved) throw new Error(`could not save the work in ${top}: ${saved.reason}`);
+    Object.assign(slot, { state: 'idle', holder: null, since: new Date().toISOString() });
+    return { path: top, savedId: saved?.id ?? null };
+  });
+}
+
+export async function listSlots(options = {}) {
+  const registry = JSON.parse(await fs.readFile(join(tidyHome(options), 'slots.json'), 'utf8').catch(() => '{"projects":{}}'));
+  return Object.entries(registry.projects).map(([common, e]) => ({ common, main: e.main, slots: e.slots }));
+}
+
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
 export async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -1086,7 +1213,26 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot'];
+  const value = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : undefined; };
+  if (command === 'slot') {
+    const action = positional[1];
+    try {
+      if (action === 'take') {
+        const r = await takeSlot({ ...options, branch: value('branch'), base: value('base'), holder: value('holder') });
+        console.log(args.has('--json') ? JSON.stringify(r) : `${r.created ? 'New slot' : 'Slot'} ${r.path} is yours, on branch ${r.branch}.${r.savedFirst ? ` Work left in it was saved first (${r.savedFirst}).` : ''}`);
+      } else if (action === 'release') {
+        const r = await releaseSlot({ ...options, path: value('path') });
+        console.log(args.has('--json') ? JSON.stringify(r) : `Released ${r.path}.${r.savedId ? ` Its work was saved (${r.savedId}).` : ''}`);
+      } else if (action === 'list' || !action) {
+        const list = await listSlots();
+        if (args.has('--json')) console.log(JSON.stringify(list, null, 2));
+        else if (!list.length) console.log('No slots yet. Take one with: codein-tidy slot take --branch=<name>');
+        else for (const p of list) { console.log(p.main); for (const s of p.slots) console.log(`  ${s.state.padEnd(7)} ${(s.branch ?? '').padEnd(36)} ${s.holder ?? ''}  ${s.path}`); }
+      } else { console.error('Usage: codein-tidy slot take --branch=NAME [--base=REF] [--holder=NAME] | slot release [--path=PATH] | slot list'); process.exitCode = 2; }
+    } catch (error) { console.error(String(error.message ?? error)); process.exitCode = error.code === 'OVER_BUDGET' ? 3 : 1; }
+    return;
+  }
   const positional = argv.filter((a) => !a.startsWith('--'));
   if (!COMMANDS.includes(command) || (older && !(options.olderThanDays >= 1)) || (['prepare', 'save'].includes(command) && !options.project)
       || (command === 'restore' && !positional[1])) {
