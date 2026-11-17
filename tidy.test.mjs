@@ -319,3 +319,80 @@ test('package caches: only with --caches; the package manager cleans; old Playwr
   // 3000 (npm) + 2000 (pnpm, measured after the prune) + chromium-100 + old npx entry.
   assert.equal(receipt.bytes, 3000 + 2000 + 1000 + 1000);
 });
+
+test('worktrees outside the tool folders are found through git, under the same rules', async () => {
+  const m = await machine();
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const remote = join(m.root, 'remote.git'), repo = join(m.root, 'repo');
+  g(['init', '--bare', '-q', remote], m.root);
+  g(['clone', '-q', remote, repo], m.root);
+  for (const [k, v] of [['user.email', 't@example.com'], ['user.name', 't'], ['commit.gpgsign', 'false']]) g(['config', k, v], repo);
+  await writeFile(join(repo, 'a.txt'), 'a'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'a'], repo); g(['push', '-q', 'origin', 'HEAD'], repo);
+  // One worktree in Codex's folder (how the repository is found), three in a folder of the user's own choosing.
+  const codexTree = join(m.home, '.codex', 'worktrees', 'w1', 'repo');
+  const elsewhere = join(m.root, 'repo-wt'), done = join(elsewhere, 'done'), wip = join(elsewhere, 'wip'), recent = join(elsewhere, 'recent');
+  for (const tree of [codexTree, done, wip, recent]) g(['worktree', 'add', '-q', '--detach', tree], repo);
+  await writeFile(join(wip, 'notes.md'), 'unfinished');
+  for (const tree of [codexTree, done, wip]) await ageTree(tree, 30);
+  const options = { ...m.options, cwd: m.root };
+
+  const plain = await scan(options);
+  const other = plain.find((p) => p.tool === 'Other git worktrees');
+  assert.ok(other, 'the outside worktrees are reported');
+  assert.equal(other.item, 'Worktrees of repo');
+  assert.deepEqual([...other.paths].sort(), [done, recent, wip].sort(), 'never the main worktree, never the Codex one twice');
+  assert.match(formatReport(plain), /with --worktrees/);
+  assert.equal((await clean(plain)).removed, 0, 'nothing without --worktrees');
+
+  const review = await reviewList(options);
+  assert.ok(review.some((w) => w.path === wip && w.work === 1), 'uncommitted work outside the tool folders is listed for review');
+
+  const plans = await scan({ ...options, worktrees: true });
+  const outside = plans.find((p) => p.tool === 'Other git worktrees');
+  assert.deepEqual(outside.removable.map((e) => e.path), [done]);
+  assert.deepEqual(outside.kept.map((k) => [k.path, k.why]).sort(), [[recent, 'used recently'], [wip, 'has uncommitted changes: needs review (codein-tidy review)']].sort());
+  const receipt = await clean(plans);
+  assert.deepEqual(receipt.failed, []);
+  assert.equal(await exists(done), false);
+  assert.equal(await exists(join(wip, 'notes.md')), true);
+  assert.equal(await exists(join(repo, 'a.txt')), true);
+  assert.equal(g(['worktree', 'list'], repo).includes('done'), false);
+
+  // Run from inside an outside worktree: that one is never a candidate.
+  const fromInside = await scan({ ...options, cwd: wip, worktrees: true });
+  assert.equal(fromInside.find((p) => p.tool === 'Other git worktrees').paths.includes(wip), false);
+});
+
+test('a path git stops listing as a worktree after the plan is never removed', async () => {
+  const m = await machine();
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const repo = join(m.root, 'repo');
+  g(['init', '-q', repo], m.root);
+  for (const [k, v] of [['user.email', 't@example.com'], ['user.name', 't'], ['commit.gpgsign', 'false']]) g(['config', k, v], repo);
+  await writeFile(join(repo, 'a.txt'), 'a'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'a'], repo);
+  const tree = join(m.root, 'side');
+  g(['worktree', 'add', '-q', tree], repo);
+  await ageTree(tree, 30);
+  const plans = await scan({ ...m.options, cwd: repo, worktrees: true });
+  assert.deepEqual(plans.find((p) => p.tool === 'Other git worktrees').removable.map((e) => e.path), [tree]);
+  // Between plan and clean, the worktree goes away and someone puts their own folder there.
+  g(['worktree', 'remove', tree], repo);
+  await aged(join(tree, 'mine.txt'), 0);
+  const receipt = await clean(plans);
+  assert.equal(receipt.removed, 0);
+  assert.match(receipt.failed[0].error, /no longer lists/);
+  assert.equal(await exists(join(tree, 'mine.txt')), true);
+});
+
+test('the summary says what each flag would free, never "0 KB more"', async () => {
+  const m = await machine();
+  const npmDir = join(m.root, 'npm-cache');
+  await aged(join(npmDir, '_cacache', 'content', 'a'), 1, 'n'.repeat(3 * 1024 * 1024));
+  await aged(join(m.home, '.codex', 'archived_sessions', 'old.jsonl'), 90, 'h'.repeat(2 * 1024 * 1024));
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old.sh'), 10, 's'.repeat(1024 * 1024));
+  const report = formatReport(await scan({ ...m.options, cwd: m.root, lookup: (c) => (c === 'npm' ? npmDir : null) }));
+  assert.doesNotMatch(report, /0 KB more/);
+  assert.match(report, /AI tools use 3 MB here\. 1 MB can be freed safely now; 2 MB with --history\./);
+  assert.match(report, /Package caches use 3 MB\. 3 MB with --caches \(they download again when needed\)\./);
+  assert.match(report, /Everything above together: 6 MB with --history --caches/);
+});

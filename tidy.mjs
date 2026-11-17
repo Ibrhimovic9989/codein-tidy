@@ -14,7 +14,7 @@
  */
 import { promises as fs } from 'node:fs';
 import { homedir, tmpdir, platform } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { basename, join, resolve, sep } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const DAY = 24 * 60 * 60_000;
@@ -180,8 +180,8 @@ function reviewInfo(path) {
 
 export async function reviewList(options = {}) {
   const list = [];
-  for (const target of targets(options).filter((t) => t.kind === 'worktrees'))
-    for (const path of await findWorktrees(target.path, target.depth ?? 2)) {
+  for (const target of [...targets(options).filter((t) => t.kind === 'worktrees'), ...await gitWorktreeTargets(options)])
+    for (const path of target.paths ?? await findWorktrees(target.path, target.depth ?? 2)) {
       const state = worktreeState(path);
       if (state.review) list.push({ tool: target.tool, ...reviewInfo(path) });
     }
@@ -207,6 +207,44 @@ async function findWorktrees(root, depth) {
   return found;
 }
 
+/** Every worktree git lists for a repository (run in its common git folder). The first is the main one. */
+function linkedWorktrees(common) {
+  const text = git(['worktree', 'list', '--porcelain'], common);
+  if (text === null) return null;
+  const blocks = text.split(/\r?\n\r?\n/).map((block) => block.split(/\r?\n/)).filter((lines) => lines[0]?.startsWith('worktree '));
+  const entries = blocks.map((lines) => ({ path: resolve(lines[0].slice('worktree '.length)),
+    bare: lines.includes('bare'), prunable: lines.some((l) => l.startsWith('prunable')) }));
+  if (!entries.length) return null;
+  return { main: entries[0].path, linked: entries.slice(1).filter((e) => !e.bare && !e.prunable).map((e) => e.path) };
+}
+
+/**
+ * Worktrees outside the tools' own folders (for example D:\work-wt\feature or ~/src/app-fix), found by asking
+ * git rather than guessing folder names: every linked worktree of each repository that a tool's worktrees belong
+ * to, and of the repository this runs in (or --project). Left out: the main worktree, the one this runs inside,
+ * missing ones, and ones already listed under a tool. Same rules as the tools' worktrees.
+ */
+export async function gitWorktreeTargets(options = {}) {
+  const toolRoots = targets(options).filter((t) => t.kind === 'worktrees').map((t) => t.path);
+  const here = resolve(options.cwd ?? process.cwd());
+  const seeds = [here, ...(options.project ? [options.project] : [])];
+  for (const root of toolRoots) seeds.push(...await findWorktrees(root, 2));
+  const commons = new Set();
+  for (const seed of seeds) {
+    const common = git(['rev-parse', '--path-format=absolute', '--git-common-dir'], seed);
+    if (common) commons.add(resolve(common));
+  }
+  const out = [];
+  for (const common of commons) {
+    const listed = linkedWorktrees(common);
+    if (!listed) continue;
+    const paths = listed.linked.filter((p) => !toolRoots.some((root) => inside(root, p)) && !inside(p, here));
+    if (paths.length) out.push({ tool: 'Other git worktrees', item: `Worktrees of ${basename(listed.main)}`, path: listed.main, paths, common,
+      kind: 'worktrees', class: 'work', ageDays: 14, deepAgeDays: 3 });
+  }
+  return out;
+}
+
 export function runningApps(os = platform()) {
   try {
     const out = os === 'win32'
@@ -221,7 +259,11 @@ export function runningApps(os = platform()) {
 async function plan(target, options) {
   const memo = new Map();
   const walkStarted = Date.now();
-  const total = await measure(target.path, new Set(), memo);
+  let total = { bytes: 0, files: 0, freeable: 0 };
+  if (target.paths) {
+    const seen = new Set();
+    for (const path of target.paths) { const m = await measure(path, seen, memo); total = { bytes: total.bytes + m.bytes, files: total.files + m.files, freeable: total.freeable + m.freeable }; }
+  } else total = await measure(target.path, new Set(), memo);
   if (process.env.CODEIN_TIDY_PROFILE) console.error(`    walk ${Date.now() - walkStarted} ms ${target.item}`);
   const out = { ...target, ...total, removable: [], skipped: undefined };
   if (!total.files && !total.bytes) return out;
@@ -260,7 +302,7 @@ async function plan(target, options) {
   if (target.kind === 'worktrees') {
     out.kept = [];
     const findStarted = Date.now();
-    const found = await findWorktrees(target.path, target.depth ?? 2);
+    const found = target.paths ?? await findWorktrees(target.path, target.depth ?? 2);
     if (process.env.CODEIN_TIDY_PROFILE) console.error(`    find ${Date.now() - findStarted} ms`);
     for (const path of found) {
       if (options.now - await newest(path, 1) <= ageMs) { out.kept.push({ path, why: 'used recently' }); continue; }
@@ -279,7 +321,12 @@ function inside(root, path) {
 }
 
 async function remove(target, entry) {
-  if (!inside(target.path, entry.path)) throw new Error(`refusing to remove outside ${target.path}`);
+  if (target.paths) {
+    // A worktree outside the tool folders: it must still be one git lists for that repository, and not the main one.
+    const listed = linkedWorktrees(target.common);
+    if (!target.paths.includes(resolve(entry.path)) || !listed?.linked.includes(resolve(entry.path)))
+      throw new Error('git no longer lists this as a linked worktree');
+  } else if (!inside(target.path, entry.path)) throw new Error(`refusing to remove outside ${target.path}`);
   if (target.kind === 'worktrees') {
     // Let git remove its own worktree, so the main repository forgets it too. Run it from the main
     // repository's git folder: on Windows a process cannot delete the folder it is running in.
@@ -423,9 +470,17 @@ async function emptyOldTrash(trashDir, now) {
  * --caches or --deep. Each package manager cleans its own cache with its own command (it knows which
  * entries are in use); the receipt reports what was really freed, measured before and after.
  */
+/** Run a package manager. On Windows npm, pnpm and yarn are .cmd files that need cmd.exe; it gets one fixed command
+ * line (our own constant words, never user input) instead of an argument list with shell: true, which Node 24
+ * flags as unsafe (DEP0190). */
+export function runTool(command, args, options) {
+  if (platform() !== 'win32') return execFileSync(command, args, options);
+  return execFileSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${[command, ...args].join(' ')}"`], { ...options, windowsVerbatimArguments: true });
+}
+
 function ask(command, args) {
   try {
-    const out = execFileSync(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20_000, shell: platform() === 'win32' });
+    const out = runTool(command, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20_000 });
     return out.trim().split(/\r?\n/).pop()?.trim() || null;
   } catch { return null; }
 }
@@ -473,7 +528,7 @@ async function oldBrowserRevisions(dir) {
 }
 
 function runCacheCommand([command, args]) {
-  execFileSync(command, args, { stdio: 'ignore', timeout: 15 * 60_000, shell: platform() === 'win32' });
+  runTool(command, args, { stdio: 'ignore', timeout: 15 * 60_000 });
 }
 
 export async function scan(options = {}) {
@@ -488,7 +543,10 @@ export async function scan(options = {}) {
     if (process.env.CODEIN_TIDY_PROFILE) console.error(`${String(Date.now() - started).padStart(7)} ms  ${target.tool}: ${target.item}`);
     return result;
   };
-  for (const target of targets(options)) plans.push(await timed(target));
+  const all = [...targets(options), ...await gitWorktreeTargets(options)];
+  // An agent reads this through a pipe, where the live progress line never shows: say once that work is under way.
+  if (!process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`codein-tidy: measuring ${all.length} places; large folders can take a minute...\n`);
+  for (const target of all) plans.push(await timed(target));
   // Package caches are always reported; they are cleaned only with --caches or --deep (see plan()).
   for (const target of cacheTargets(options)) plans.push(await timed(target));
   if (process.stderr.isTTY) process.stderr.write('\x1b[2K');
@@ -545,8 +603,23 @@ export function formatReport(plans, { cleaning = false } = {}) {
   const freeOf = (list) => list.filter((p) => !p.skipped).reduce((sum, p) => sum + p.removable.reduce((s, e) => s + e.freeable, 0), 0);
   const tools = present.filter((p) => p.class !== 'project' && p.tool !== 'Package caches');
   const caches = present.filter((p) => p.tool === 'Package caches');
-  lines.push('', `AI tools use ${size(tools.reduce((sum, p) => sum + p.bytes, 0))} here. ${size(freeOf(tools))} can be freed safely now.`);
-  if (caches.length) lines.push(`Package caches use ${size(caches.reduce((sum, p) => sum + p.bytes, 0))}. ${size(freeOf(caches))} ${caches.some((p) => p.skipped) ? 'more with --caches' : 'can be freed now'}.`);
+  // What the flags would add: everything held back only because a flag was not given (not apps that are running).
+  const held = (list) => {
+    const byFlag = new Map();
+    for (const p of list) {
+      const flag = p.skipped?.match(/add (--[a-z]+)/)?.[1];
+      const free = p.removable.reduce((s, e) => s + e.freeable, 0);
+      if (flag && free) byFlag.set(flag, (byFlag.get(flag) ?? 0) + free);
+    }
+    return byFlag;
+  };
+  const extra = (byFlag) => [...byFlag].map(([flag, bytes]) => `${size(bytes)} with ${flag}`).join(', ');
+  const toolsHeld = held(tools), cachesHeld = held(caches);
+  lines.push('', `AI tools use ${size(tools.reduce((sum, p) => sum + p.bytes, 0))} here. ${size(freeOf(tools))} can be freed safely now${toolsHeld.size ? `; ${extra(toolsHeld)}` : ''}.`);
+  if (caches.length) lines.push(`Package caches use ${size(caches.reduce((sum, p) => sum + p.bytes, 0))}. ${cachesHeld.size ? `${extra(cachesHeld)} (they download again when needed)` : `${size(freeOf(caches))} can be freed now`}.`);
+  const all = new Map([...toolsHeld]);
+  for (const [flag, bytes] of cachesHeld) all.set(flag, (all.get(flag) ?? 0) + bytes);
+  if (all.size > 1) lines.push(`Everything above together: ${size(freeOf(tools) + freeOf(caches) + [...all.values()].reduce((a, b) => a + b, 0))} with ${[...all.keys()].join(' ')} (or --deep for temp files, caches and worktrees at shorter ages).`);
   const junk = present.filter((p) => p.kind === 'trash');
   if (junk.length) lines.push(`Agent leftovers in this project: ${junk.reduce((s, p) => s + p.removable.length, 0)} file(s), ${size(junk.reduce((s, p) => s + p.bytes, 0))}.`);
   if (!present.length) lines.push('None of the supported tools has data on this machine.');
