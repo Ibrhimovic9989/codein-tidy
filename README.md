@@ -21,6 +21,10 @@ It never removes Cursor's chat database or Antigravity's `brain` folder (the onl
 it skips an app's cache while that app is running. Worktrees are removed by git itself, so your main
 repository forgets them too. Every worktree it keeps is listed with the reason.
 
+It also finds worktrees made outside the tools' own folders (for example `D:\work-wt\feature` or `~/src/app-fix`):
+it asks git for every worktree of the repositories the tools work in, and of the repository you run it from. The
+same rules apply, and the main checkout is never touched.
+
 ### Deep clean
 
 `--deep` frees much more: temp and scratch files of finished sessions after one day, and committed worktrees
