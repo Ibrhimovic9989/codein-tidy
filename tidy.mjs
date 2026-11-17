@@ -15,9 +15,13 @@
 import { promises as fs } from 'node:fs';
 import { homedir, tmpdir, platform } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 
 const DAY = 24 * 60 * 60_000;
+// Measuring is millions of small file-system calls; Node runs them on a pool of 4 threads by default. The pool
+// is created by the first call, so this must run before any. (Inside a host that already used the pool it is a
+// harmless no-op.)
+if (!process.env.UV_THREADPOOL_SIZE) process.env.UV_THREADPOOL_SIZE = '64';
 
 /** Where each OS keeps application data. */
 function appData(env, os, home) {
@@ -98,38 +102,116 @@ async function measure(path, seen = new Set(), memo = null, depth = 0) {
     if (key) seen.add(key);
     return { bytes: size, files: 1, freeable: stat.nlink <= 1n ? size : 0 };
   }
+  return measureDir(path, seen, memo, depth);
+}
+
+/** A folder's total. The listing already says which entries are folders and links, so only files are stat'ed. */
+async function measureDir(path, seen, memo, depth) {
   let bytes = 0, files = 0, freeable = 0;
-  const names = await fs.readdir(path).catch(() => []);
+  const entries = await fs.readdir(path, { withFileTypes: true }).catch(() => []);
   // pnpm's node_modules holds hard links into its store: removing it frees almost nothing, and walking its
   // hundreds of thousands of files is most of the time a report takes. Skip it when sampled files are shared.
-  if (names.includes('.pnpm') && path.split(/[\\/]/).pop() === 'node_modules' && await pnpmLinked(join(path, '.pnpm'))) {
-    return { bytes: 0, files: 0, freeable: 0, sharedModules: 1 };
+  if (path.split(/[\\/]/).pop() === 'node_modules' && entries.some((e) => e.name === '.pnpm') && await pnpmLinked(join(path, '.pnpm'))) {
+    const result = { bytes: 0, files: 0, freeable: 0, sharedModules: 1 };
+    if (memo && depth <= 3) memo.set(resolve(path), result);
+    return result;
   }
-  for (let i = 0; i < names.length; i += 32) {
-    const parts = await Promise.all(names.slice(i, i + 32).map((name) => measure(join(path, name), seen, memo, depth + 1)));
-    for (const part of parts) { bytes += part.bytes; files += part.files; freeable += part.freeable; }
+  // node_modules is most of a checkout's files. When its package files are plain copies, let Windows list it
+  // faster. Hard links shared between checkouts must be counted once, which only the exact walk can do, so a
+  // single linked file in the sample keeps the walk.
+  if (path.split(/[\\/]/).pop() === 'node_modules' && platform() === 'win32') {
+    const samples = await packageLinks(entries.some((e) => e.name === '.pnpm') ? join(path, '.pnpm') : path, 12);
+    if (samples.length >= 3 && !samples.some((n) => n >= 2n)) {
+      const listed = await listedTotals(path);
+      if (listed) {
+        const result = { bytes: listed.bytes, files: listed.files, freeable: listed.bytes };
+        if (memo && depth <= 3) memo.set(resolve(path), result);
+        return result;
+      }
+    }
   }
+  const one = (entry) => {
+    const child = join(path, entry.name);
+    if (entry.isSymbolicLink()) return { bytes: 0, files: 0, freeable: 0 };
+    if (entry.isDirectory()) return measureDir(child, seen, memo, depth + 1);
+    return measure(child, seen, memo, depth + 1); // files, and anything the listing could not type
+  };
+  let sharedModules = 0;
+  for (let i = 0; i < entries.length; i += 64) {
+    const parts = await Promise.all(entries.slice(i, i + 64).map(one));
+    for (const part of parts) { bytes += part.bytes; files += part.files; freeable += part.freeable; sharedModules += part.sharedModules ?? 0; }
+  }
+  const result = sharedModules ? { bytes, files, freeable, sharedModules } : { bytes, files, freeable };
   // Remember the upper levels, so planning never walks a folder a second time.
-  if (memo && depth <= 3) memo.set(resolve(path), { bytes, files, freeable });
-  return { bytes, files, freeable };
+  if (memo && depth <= 3) memo.set(resolve(path), result);
+  return result;
 }
 
 /** True when sampled files under a pnpm virtual store are hard links (store on the same drive), not copies. */
 async function pnpmLinked(dir) {
+  // One package file from each of 12 packages. Most linked means a store-linked install: a few packages built
+  // on install hold unlinked files, which is why "every sample linked" never held on real machines (2026-11-17:
+  // 84,199 of 85,539 files linked, yet the old check walked all of them, most of the report's time).
+  const samples = await packageLinks(dir, 12);
+  return samples.length >= 3 && samples.filter((nlink) => nlink >= 2n).length >= samples.length * 0.75;
+}
+
+/** Link counts of one real file from each of up to `limit` different packages under `root` (never from .bin,
+ * whose small shims are always copies and once made the sample say "not linked" for a linked folder). */
+async function packageLinks(root, limit) {
   const samples = [];
-  async function find(path, depth) {
-    if (samples.length >= 5 || depth > 5) return;
-    for (const name of (await fs.readdir(path).catch(() => [])).slice(0, 8)) {
-      if (samples.length >= 5) return;
-      const stat = await fs.lstat(join(path, name), { bigint: true }).catch(() => null);
-      if (!stat || stat.isSymbolicLink()) continue;
-      // Top-level files (lock.yaml) are pnpm's own bookkeeping, never linked: sample package files only.
-      if (stat.isFile()) { if (depth >= 2) samples.push(stat.nlink); }
-      else if (stat.isDirectory()) await find(join(path, name), depth + 1);
+  const firstFile = async (dir, depth) => {
+    if (depth > 6) return null;
+    const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+    for (const e of entries) if (e.isFile()) {
+      const stat = await fs.lstat(join(dir, e.name), { bigint: true }).catch(() => null);
+      if (stat?.isFile()) return stat.nlink;
     }
+    for (const e of entries) if (e.isDirectory() && !e.isSymbolicLink() && e.name !== '.bin') {
+      const found = await firstFile(join(dir, e.name), depth + 1);
+      if (found !== null) return found;
+    }
+    return null;
+  };
+  for (const e of await fs.readdir(root, { withFileTypes: true }).catch(() => [])) {
+    if (samples.length >= limit) break;
+    if (!e.isDirectory() || e.isSymbolicLink() || e.name.startsWith('.')) continue;
+    const nlink = await firstFile(join(root, e.name), 1);
+    if (nlink !== null) samples.push(nlink);
   }
-  await find(dir, 0);
-  return samples.length >= 3 && samples.every((nlink) => nlink >= 2n);
+  return samples;
+}
+
+
+/**
+ * Windows only: a folder's file count and bytes from robocopy's list-only mode (/L: nothing is copied), which
+ * reads sizes from the directory listing instead of opening each file, about 3 times faster than one stat per
+ * file. Junctions and symlinks are skipped (/XJ), as the walk skips them. Used only for folders whose sampled
+ * files are not hard links, so every byte counted is a byte freed. Any doubt returns null and the walk runs.
+ */
+const LISTERS = 6;
+let listing = 0;
+const waiting = [];
+async function listedTotals(dir) {
+  if (platform() !== 'win32' || process.env.CODEIN_TIDY_NO_ROBOCOPY) return null;
+  if (listing >= LISTERS) await new Promise((resume) => waiting.push(resume));
+  listing += 1;
+  try {
+    const nowhere = join(tmpdir(), `codein-tidy-list-only-${process.pid}-${Math.random().toString(36).slice(2)}`);
+    const out = await new Promise((done) => execFile('robocopy', [dir, nowhere, '/L', '/E', '/XJ', '/NFL', '/NDL', '/NJH', '/BYTES', '/R:0', '/W:0'],
+      { encoding: 'utf8', windowsHide: true, maxBuffer: 1 << 20, timeout: 10 * 60_000 },
+      // robocopy exit codes 0 to 7 are success (1 = "files would be copied"); 8 and above are failures.
+      (error, stdout) => done(error && !(typeof error.code === 'number' && error.code < 8) ? null : stdout)));
+    if (!out) return null;
+    // The summary rows are Dirs, Files, Bytes (labels are translated, the order is not); the first number is the total.
+    const rows = out.split(/\r?\n/).map((line) => line.match(/^\s*[^\d\s][^:]*:\s+(\d+)\s+\d+/)).filter(Boolean);
+    if (rows.length < 3) return null;
+    if (process.env.CODEIN_TIDY_PROFILE) console.error(`    listed ${dir}: ${rows[1][1]} files, ${rows[2][1]} bytes`);
+    return { files: Number(rows[1][1]), bytes: Number(rows[2][1]) };
+  } finally {
+    listing -= 1;
+    waiting.shift()?.();
+  }
 }
 
 /** Newest change in a tree down to `depth` levels: a folder in use has fresh entries. */
@@ -262,7 +344,9 @@ async function plan(target, options) {
   let total = { bytes: 0, files: 0, freeable: 0 };
   if (target.paths) {
     const seen = new Set();
-    for (const path of target.paths) { const m = await measure(path, seen, memo); total = { bytes: total.bytes + m.bytes, files: total.files + m.files, freeable: total.freeable + m.freeable }; }
+    for (const m of await Promise.all(target.paths.map((path) => measure(path, seen, memo))))
+      total = { bytes: total.bytes + m.bytes, files: total.files + m.files, freeable: total.freeable + m.freeable,
+        sharedModules: (total.sharedModules ?? 0) + (m.sharedModules ?? 0) };
   } else total = await measure(target.path, new Set(), memo);
   if (process.env.CODEIN_TIDY_PROFILE) console.error(`    walk ${Date.now() - walkStarted} ms ${target.item}`);
   const out = { ...target, ...total, removable: [], skipped: undefined };
@@ -535,20 +619,21 @@ export async function scan(options = {}) {
   const now = options.now ?? Date.now();
   const running = options.running ?? runningApps(options.os);
   const opts = { ...options, now, running, worktrees: options.worktrees || options.deep };
-  const plans = [];
-  const timed = async (target) => {
+  // Package caches are always reported; they are cleaned only with --caches or --deep (see plan()).
+  const all = [...targets(options), ...await gitWorktreeTargets(options), ...cacheTargets(options)];
+  // An agent reads this through a pipe, where the live progress line never shows: say once that work is under way.
+  if (!process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`codein-tidy: measuring ${all.length} places...\n`);
+  let finished = 0;
+  const progress = () => { if (process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`\x1b[2KMeasuring ${all.length} places: ${finished} done...\r`); };
+  progress();
+  // Places are independent, so they are measured at the same time; the report keeps their order.
+  const plans = await Promise.all(all.map(async (target) => {
     const started = Date.now();
-    if (process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`\x1b[2KMeasuring ${target.tool}: ${target.item}...\r`);
     const result = await plan(target, opts);
+    finished += 1; progress();
     if (process.env.CODEIN_TIDY_PROFILE) console.error(`${String(Date.now() - started).padStart(7)} ms  ${target.tool}: ${target.item}`);
     return result;
-  };
-  const all = [...targets(options), ...await gitWorktreeTargets(options)];
-  // An agent reads this through a pipe, where the live progress line never shows: say once that work is under way.
-  if (!process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`codein-tidy: measuring ${all.length} places; large folders can take a minute...\n`);
-  for (const target of all) plans.push(await timed(target));
-  // Package caches are always reported; they are cleaned only with --caches or --deep (see plan()).
-  for (const target of cacheTargets(options)) plans.push(await timed(target));
+  }));
   if (process.stderr.isTTY) process.stderr.write('\x1b[2K');
   if (options.project) plans.push(...await projectPlans(options.project, opts));
   return plans;
@@ -598,6 +683,7 @@ export function formatReport(plans, { cleaning = false } = {}) {
       : free ? `${size(free)} ${cleaning ? 'will be freed' : 'can be freed'}${toReview ? `; ${toReview} hold uncommitted work: review and commit them first` : ''}`
       : toReview ? `${toReview} hold uncommitted work: review and commit them first` : 'nothing old enough';
     lines.push(`  ${size(p.bytes).padStart(8)}  ${p.item.padEnd(34)} ${action}`);
+    if (p.sharedModules) lines.push(`            not counted: ${p.sharedModules} node_modules linked to the pnpm store (removing them frees almost nothing)`);
     for (const kept of (p.kept ?? []).slice(0, 5)) lines.push(`            kept ${kept.path}: ${kept.why}`);
   }
   const freeOf = (list) => list.filter((p) => !p.skipped).reduce((sum, p) => sum + p.removable.reduce((s, e) => s + e.freeable, 0), 0);
@@ -669,8 +755,13 @@ export async function main(argv) {
     return;
   }
   const plans = await scan(options);
-  if (args.has('--json')) { console.log(JSON.stringify(plans, null, 2)); }
-  else console.log(formatReport(plans, { cleaning: command === 'clean' && args.has('--yes') }));
+  if (args.has('--json')) {
+    // Machine-readable means only JSON on stdout: no plan notice, receipt text or footer after it.
+    if (command === 'clean' && args.has('--yes')) console.log(JSON.stringify({ plans, receipt: await clean(plans) }, null, 2));
+    else console.log(JSON.stringify(plans, null, 2));
+    return;
+  }
+  console.log(formatReport(plans, { cleaning: command === 'clean' && args.has('--yes') }));
   if (command === 'clean') {
     if (!args.has('--yes')) { console.log('\nThis was a plan. Nothing was removed. Run again with --yes to remove the items above.'); return; }
     const receipt = await clean(plans);

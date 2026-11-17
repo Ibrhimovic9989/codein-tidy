@@ -28,7 +28,8 @@ async function ageTree(path, days) {
 async function machine() {
   const root = await mkdtemp(join(tmpdir(), 'tidy-'));
   const home = join(root, 'home'), temp = join(root, 'temp'), config = join(root, 'config');
-  return { root, home, temp, config, options: { home, temp, os: 'linux', env: { XDG_CONFIG_HOME: config }, running: new Set(), lookup: () => null } };
+  // cwd too: worktree discovery asks git about the repository it runs in, which must be the test's, never the real one.
+  return { root, home, temp, config, options: { home, temp, cwd: root, os: 'linux', env: { XDG_CONFIG_HOME: config }, running: new Set(), lookup: () => null } };
 }
 
 test('report only reads, and counts what each tool holds', async () => {
@@ -395,4 +396,63 @@ test('the summary says what each flag would free, never "0 KB more"', async () =
   assert.match(report, /AI tools use 3 MB here\. 1 MB can be freed safely now; 2 MB with --history\./);
   assert.match(report, /Package caches use 3 MB\. 3 MB with --caches \(they download again when needed\)\./);
   assert.match(report, /Everything above together: 6 MB with --history --caches/);
+});
+
+test('a node_modules mostly linked to the pnpm store is skipped and named; a copied one is counted', async () => {
+  const m = await machine();
+  const { link } = await import('node:fs/promises');
+  const store = join(m.root, 'store');
+  const linked = join(m.home, '.claude', 'shell-snapshots', 'linked', 'node_modules');
+  const copied = join(m.home, '.claude', 'shell-snapshots', 'copied', 'node_modules');
+  for (let i = 0; i < 12; i++) {
+    const rel = join('.pnpm', `pkg${i}@1.0.0`, 'node_modules', `pkg${i}`, 'index.js');
+    await aged(join(store, `f${i}`), 10, 's'.repeat(5000));
+    await mkdir(join(linked, rel, '..'), { recursive: true });
+    // Two packages were built on install: their files are copies, as on a real machine.
+    if (i < 10) await link(join(store, `f${i}`), join(linked, rel)); else await aged(join(linked, rel), 10, 'b'.repeat(5000));
+    await aged(join(copied, rel), 10, 'c'.repeat(3000));
+  }
+  const plans = await scan({ ...m.options, cwd: m.root });
+  const snapshots = plans.find((p) => p.item === 'Shell snapshots');
+  assert.equal(snapshots.bytes, 12 * 3000, 'only the copied node_modules is counted');
+  assert.equal(snapshots.sharedModules, 1);
+  assert.match(formatReport(plans), /not counted: 1 node_modules linked to the pnpm store/);
+});
+
+test('--json prints only JSON, in report and clean modes', async () => {
+  const m = await machine();
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old.sh'), 10);
+  // A real child process reads the real environment: redirect EVERY root the tool reads (2026-11-17: an earlier
+  // version of this test left APPDATA real and its clean --yes emptied the developer's Antigravity app caches).
+  const local = join(m.root, 'local'), roaming = join(m.root, 'roaming');
+  const env = { ...process.env, HOME: m.home, USERPROFILE: m.home, TEMP: m.temp, TMP: m.temp, TMPDIR: m.temp,
+    APPDATA: roaming, LOCALAPPDATA: local, XDG_CONFIG_HOME: m.config, XDG_CACHE_HOME: join(m.root, 'xdg-cache'),
+    CLAUDE_CONFIG_DIR: join(m.home, '.claude'), CODEX_HOME: join(m.home, '.codex'), PLAYWRIGHT_BROWSERS_PATH: join(local, 'ms-playwright'),
+    npm_config_cache: join(m.root, 'npm-cache'), CODEIN_TIDY_PROFILE: '' };
+  const run = (...args) => execFileSync(process.execPath, [join(process.cwd(), 'tidy.mjs'), ...args], { cwd: m.root, env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  const plan = JSON.parse(run('clean', '--json'));
+  assert.ok(Array.isArray(plan));
+  assert.ok(Array.isArray(JSON.parse(run('report', '--json'))));
+  // Guard before the one real clean: everything it would touch must be inside this test's folder.
+  const touched = plan.filter((p) => !p.skipped && p.removable?.length).flatMap((p) => p.removable.map((e) => e.path));
+  const outside = touched.filter((path) => !path.startsWith(m.root));
+  assert.deepEqual(outside, [], 'refusing to run clean --yes: it would touch paths outside the test folder');
+  assert.equal(touched.length, 1);
+  const done = JSON.parse(run('clean', '--yes', '--json'));
+  assert.equal(done.receipt.removed, 1);
+  assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old.sh')), false);
+});
+
+test('Windows: the fast listing of a copied node_modules equals the exact walk', { skip: process.platform !== 'win32' }, async () => {
+  const m = await machine();
+  const modules = join(m.home, '.claude', 'shell-snapshots', 'app', 'node_modules');
+  for (let i = 0; i < 6; i++) await aged(join(modules, `pkg${i}`, 'lib', 'index.js'), 10, 'x'.repeat(1000 + i));
+  await aged(join(modules, '.bin', 'pkg0.cmd'), 10, 'shim');
+  const fast = (await scan({ ...m.options, cwd: m.root })).find((p) => p.item === 'Shell snapshots');
+  process.env.CODEIN_TIDY_NO_ROBOCOPY = '1';
+  try {
+    const walked = (await scan({ ...m.options, cwd: m.root })).find((p) => p.item === 'Shell snapshots');
+    assert.deepEqual([fast.bytes, fast.files], [walked.bytes, walked.files]);
+    assert.equal(fast.bytes, 6 * 1000 + 15 + 4);
+  } finally { delete process.env.CODEIN_TIDY_NO_ROBOCOPY; }
 });
