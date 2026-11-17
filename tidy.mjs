@@ -1203,6 +1203,53 @@ export async function listSlots(options = {}) {
   return Object.entries(registry.projects).map(([common, e]) => ({ common, main: e.main, slots: e.slots }));
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Enforcement. A pre-shell hook (Claude Code PreToolUse, Codex PreToolUse, Cursor beforeShellExecution) hands
+// guard-shell the command an agent is about to run. A `git worktree add` in a project at its budget is refused,
+// with the way forward. Anything else, and any error, is allowed: the guard must never break an agent's shell.
+// ---------------------------------------------------------------------------------------------------------------
+const WORKTREE_ADD = /(?:^|[;&|(]\s*|\s)git((?:\s+-C\s+(?:"[^"]*"|'[^']*'|\S+)|\s+-c\s+\S+|\s+--[\w-]+(?:=\S+)?)*)\s+worktree\s+add\b/;
+
+export async function guardShell(input, options = {}) {
+  const tool = input?.tool_input ?? input?.toolInput ?? {};
+  const command = [tool.command, tool.cmd, input?.command].map((c) => Array.isArray(c) ? c.join(' ') : c).find((c) => typeof c === 'string') ?? '';
+  const match = WORKTREE_ADD.exec(command);
+  if (!match) return null;
+  const dirArg = /-C\s+("([^"]*)"|'([^']*)'|(\S+))/.exec(match[1] ?? '');
+  const cwd = resolve(input?.cwd ?? options.cwd ?? process.cwd());
+  const where = dirArg ? resolve(cwd, dirArg[2] ?? dirArg[3] ?? dirArg[4]) : cwd;
+  let p;
+  try { p = projectOf(where); } catch { return null; }
+  const budget = await projectBudget(p.main);
+  if (p.linked.length < budget) return null;
+  return `${basename(p.main)} already has ${p.linked.length} worktree(s); its budget is ${budget}. Do not create another one. ` +
+    'Take a working folder from the pool instead: `npx -y codein-tidy@latest slot take --branch=<name>` (it reuses an idle one). ' +
+    'If none is free, run `npx -y codein-tidy@latest close` to see which idle worktrees can be saved and freed, and ask the person before running it with --yes.';
+}
+
+export const RULES_BLOCK = `<!-- codein-tidy:start -->
+## Working folders (codein-tidy)
+
+Keep this project lean. Work lives in git; folders are disposable.
+- Do not run \`git worktree add\`. Take a working folder from the project's pool: \`npx -y codein-tidy@latest slot take --branch=<name>\`, and release it when the task ends: \`npx -y codein-tidy@latest slot release\`.
+- Before a session ends, commit your work on its branch. Never leave work only in a folder.
+- Scratch files (probes, screenshots, logs) go in the system temp folder, never in the project.
+- At the start of a session, check unfinished work: \`npx -y codein-tidy@latest work\`. Tell the person what is there before starting something new.
+- Never delete, reset or stash someone's uncommitted work. Ask the person before pushing or merging.
+<!-- codein-tidy:end -->`;
+
+export async function writeRules(project) {
+  const top = git(['rev-parse', '--show-toplevel'], project);
+  if (!top) throw new Error(`${project} is not inside a git project`);
+  const file = join(top, 'AGENTS.md');
+  const text = await fs.readFile(file, 'utf8').catch(() => '');
+  const start = text.indexOf('<!-- codein-tidy:start -->'), end = text.indexOf('<!-- codein-tidy:end -->');
+  const next = start >= 0 && end > start ? text.slice(0, start) + RULES_BLOCK + text.slice(end + '<!-- codein-tidy:end -->'.length)
+    : (text ? text.replace(/\s*$/, '\n\n') : '') + RULES_BLOCK + '\n';
+  if (next !== text) await fs.writeFile(file, next);
+  return { file, changed: next !== text };
+}
+
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
 export async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -1213,7 +1260,24 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules'];
+  if (command === 'guard-shell') {
+    // Called by a harness's pre-shell hook with the tool call as JSON on stdin. Silent allow by default.
+    try {
+      let raw = ''; for await (const chunk of process.stdin) raw += chunk;
+      const reason = await guardShell(raw.trim() ? JSON.parse(raw) : {});
+      if (reason) {
+        if (args.has('--cursor')) console.log(JSON.stringify({ permission: 'deny', user_message: reason, agent_message: reason }));
+        else console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }));
+      }
+    } catch {}
+    return;
+  }
+  if (command === 'rules') {
+    if (args.has('--write')) { const r = await writeRules(options.project ?? process.cwd()); console.log(r.changed ? `Added the codein-tidy rules to ${r.file}.` : `${r.file} already has them.`); }
+    else console.log(RULES_BLOCK);
+    return;
+  }
   const value = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : undefined; };
   if (command === 'slot') {
     const action = positional[1];

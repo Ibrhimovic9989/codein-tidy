@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -689,4 +689,32 @@ test('slots: a budget of working folders, reused across tasks; work left in a sl
   assert.deepEqual([back.restored, back.branch], [true, 'task-a']);
   const [listed] = await listSlots({ home: m.home });
   assert.deepEqual(listed.slots.map((s) => [s.branch, s.state, s.holder]), [['task-c', 'in use', 'claude'], ['task-b', 'in use', 'codex']]);
+});
+
+test('guard: git worktree add is refused at the budget, allowed under it; other commands always pass', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.codein-tidy.json'), JSON.stringify({ budget: 1 }));
+  const call = (command, cwd = repo) => guardShell({ tool_name: 'Bash', tool_input: { command }, cwd });
+  assert.equal(await call('git worktree add ../a -b a'), null, 'under budget');
+  g(['worktree', 'add', '-q', '-b', 'one', join(m.root, 'one')], repo);
+  for (const command of ['git worktree add ../b -b b', 'cd x && git worktree add ../b', 'git -c core.x=1 worktree add ../b', `git -C "${repo}" worktree add ../b`])
+    assert.match(await call(command, command.includes('-C') ? m.root : repo) ?? '', /budget is 1.*slot take/s, command);
+  for (const command of ['git worktree list', 'git worktree remove ../one', 'git status', 'npm test', 'git worktree prune'])
+    assert.equal(await call(command), null, command);
+  assert.equal(await call('git worktree add ../c', m.root), null, 'outside a git project: allowed');
+  assert.equal(await guardShell({}), null);
+});
+
+test('rules: added to AGENTS.md once, updated in place, other text kept', async () => {
+  const m = await machine();
+  const { repo } = await project(m);
+  const { readFile } = await import('node:fs/promises');
+  await writeFile(join(repo, 'AGENTS.md'), '# Project rules\n\nUse tabs.\n');
+  assert.equal((await writeRules(repo)).changed, true);
+  assert.equal((await writeRules(repo)).changed, false);
+  const text = await readFile(join(repo, 'AGENTS.md'), 'utf8');
+  assert.ok(text.startsWith('# Project rules\n\nUse tabs.\n\n<!-- codein-tidy:start -->'));
+  assert.equal(text.split('codein-tidy:start').length, 2);
+  assert.ok(text.includes(RULES_BLOCK));
 });
