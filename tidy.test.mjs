@@ -2,9 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -596,4 +596,67 @@ test('save: a branch comes back on its branch; a clean folder needs no save; too
   const handle = await open(join(repo, 'big.bin'), 'w'); await handle.truncate(21 * 1024 * 1024); await handle.close();
   const blocked = await saveFolder(repo, { home: m.home });
   assert.equal(blocked.saved, false); assert.match(blocked.reason, /too large to keep: big\.bin/);
+});
+
+test('close: idle worktrees are saved into one file and freed; recent, locked and current ones stay', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), '.env.local\nnode_modules/\n'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const wt = (name) => join(m.root, 'wt', name);
+  g(['worktree', 'add', '-q', '-b', 'dirty', wt('dirty')], repo); await writeFile(join(wt('dirty'), 'work.js'), 'unfinished');
+  await aged(join(wt('dirty'), '.tmp-probe.py'), 0);
+  g(['worktree', 'add', '-q', '--detach', wt('done'), 'main'], repo);
+  g(['worktree', 'add', '-q', '--detach', wt('env'), 'main'], repo); await writeFile(join(wt('env'), '.env.local'), 'KEY=1');
+  await aged(join(wt('env'), 'node_modules', 'x', 'i.js'), 0);
+  g(['worktree', 'add', '-q', '--detach', wt('locked'), 'main'], repo); g(['worktree', 'lock', wt('locked')], repo);
+  g(['worktree', 'add', '-q', '--detach', wt('recent'), 'main'], repo);
+  g(['worktree', 'add', '-q', '--detach', wt('here'), 'main'], repo);
+  const later = Date.now() + 3 * DAY;
+  const { utimes } = await import('node:fs/promises');
+  await writeFile(join(wt('recent'), 'touch.txt'), 'x'); await utimes(join(wt('recent'), 'touch.txt'), new Date(later), new Date(later));
+
+  const plan = await closePlan({ ...m.options, cwd: wt('here'), now: later });
+  assert.deepEqual(plan.candidates.map((x) => basename(x.path)).sort(), ['dirty', 'done', 'env']);
+  const keep = Object.fromEntries(plan.folders.filter((x) => x.keep).map((x) => [basename(x.path), x.keep]));
+  assert.deepEqual(keep, { locked: 'locked in git', recent: 'used today', here: 'you are working in it' });
+  assert.match(formatClose(plan), /3 idle worktree\(s\) can be closed/);
+
+  const receipt = await closeFolders(plan, { home: m.home });
+  assert.deepEqual(receipt.failed, []);
+  assert.equal(receipt.closed.length, 3);
+  for (const name of ['dirty', 'done', 'env']) assert.equal(await exists(wt(name)), false);
+  for (const name of ['locked', 'recent', 'here']) assert.equal(await exists(wt(name)), true);
+  assert.equal(await exists(join(repo, 'a.txt')), true, 'the main checkout is never touched');
+  assert.equal(receipt.saved.length, 2, 'dirty (its work) and env (its local file); done had nothing to save');
+  assert.equal(receipt.bundles.length, 1, 'one file for the project');
+  // The bundle holds the commits no remote has: the dirty folder's snapshot. The env folder's commit is on the
+  // remote already; its local file is in the keep folder.
+  const heads = g(['bundle', 'list-heads', receipt.bundles[0]], repo).split('\n');
+  assert.equal(heads.length, 1);
+  assert.equal(heads[0].split(' ')[0], receipt.saved.find((r) => r.path === wt('dirty')).snapshot);
+
+  const saved = await savedList({ home: m.home });
+  const back = await restoreSaved(saved.find((r) => r.path === wt('dirty')).id, { home: m.home });
+  assert.deepEqual([back.restored, back.branch], [true, 'dirty']);
+  const { readFile } = await import('node:fs/promises');
+  assert.equal(await readFile(join(wt('dirty'), 'work.js'), 'utf8'), 'unfinished');
+  const env = await restoreSaved(saved.find((r) => r.path === wt('env')).id, { home: m.home });
+  assert.equal(env.restored, true);
+  assert.equal(await readFile(join(wt('env'), '.env.local'), 'utf8'), 'KEY=1');
+});
+
+test('clean --worktrees keeps a copy of ignored local files before git deletes them', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), '.env.local\n'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const tree = join(m.home, '.codex', 'worktrees', 'w1', 'app');
+  g(['worktree', 'add', '-q', '--detach', tree, 'main'], repo);
+  await writeFile(join(tree, '.env.local'), 'TOKEN=only-copy');
+  await ageTree(tree, 30);
+  const receipt = await clean(await scan({ ...m.options, worktrees: true }));
+  assert.deepEqual(receipt.failed, []);
+  assert.equal(await exists(tree), false);
+  const [record] = await savedList({ home: m.home });
+  const { readFile } = await import('node:fs/promises');
+  assert.equal(await readFile(join(record.kept.dir, '.env.local'), 'utf8'), 'TOKEN=only-copy');
 });

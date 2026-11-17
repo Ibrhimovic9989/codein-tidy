@@ -536,6 +536,10 @@ async function remove(target, entry) {
       throw new Error('git no longer lists this as a linked worktree');
   } else if (!inside(target.path, entry.path)) throw new Error(`refusing to remove outside ${target.path}`);
   if (target.kind === 'worktrees') {
+    // git deletes ignored files of a "clean" worktree without asking (.env.local, local config): keep a copy of
+    // any it cannot rebuild first (verified 2026-11-17).
+    const saved = await saveFolder(entry.path, { home: target.home });
+    if (!saved.saved && !/nothing here/.test(saved.reason)) throw new Error(`not removed: ${saved.reason}`);
     // Let git remove its own worktree, so the main repository forgets it too. Run it from the main
     // repository's git folder: on Windows a process cannot delete the folder it is running in.
     const common = git(['rev-parse', '--git-common-dir'], entry.path);
@@ -764,6 +768,7 @@ export async function scan(options = {}) {
   }));
   if (process.stderr.isTTY) process.stderr.write('\x1b[2K');
   if (options.project) plans.push(...await projectPlans(options.project, opts));
+  for (const p of plans) p.home = options.home; // where saved work goes (tests pass their own home)
   return plans;
 }
 
@@ -836,6 +841,8 @@ export function formatReport(plans, { cleaning = false } = {}) {
   if (all.size > 1) lines.push(`Everything above together: ${size(freeOf(tools) + freeOf(caches) + [...all.values()].reduce((a, b) => a + b, 0))} with ${[...all.keys()].join(' ')} (or --deep for temp files, caches and worktrees at shorter ages).`);
   const junk = present.filter((p) => p.kind === 'trash');
   if (junk.length) lines.push(`Agent leftovers in this project: ${junk.reduce((s, p) => s + p.removable.length, 0)} file(s), ${size(junk.reduce((s, p) => s + p.bytes, 0))}.`);
+  const heldWork = present.filter((p) => p.kind === 'worktrees').reduce((n, p) => n + (p.kept ?? []).filter((k) => k.review).length, 0);
+  if (heldWork) lines.push(`${heldWork} worktree(s) are kept only because they hold work. \`codein-tidy close\` saves that work into one file per project, then frees them.`);
   if (!present.length) lines.push('None of the supported tools has data on this machine.');
   return lines.join('\n').trimStart();
 }
@@ -949,13 +956,82 @@ export async function saveFolder(path, options = {}) {
     kept.push({ rel: f.rel, bytes: f.bytes, sha256: hash });
   }
   if (kept.length) await fs.writeFile(join(keepDir, 'manifest.json'), JSON.stringify({ id, files: kept }, null, 2));
-  const bundle = await writeBundle(p.top, [ref], join(tidyHome(options), 'saved', `${slug(name)}-${id}.bundle`));
+  // close writes one bundle per project for the whole run (deferIndex), save writes one per folder.
+  const bundle = options.deferIndex ? null : await writeBundle(p.top, [ref], join(tidyHome(options), 'saved', `${slug(name)}-${id}.bundle`));
   const record = { id, project: name, common, path: p.top, branch: p.branch, head: p.head, snapshot, tree: p.tree, ref, bundle,
     kept: kept.length ? { dir: keepDir, files: kept.length, bytes: kept.reduce((s, f) => s + f.bytes, 0) } : null, work: p.work, savedAt: new Date(now).toISOString(),
     restore: `npx codein-tidy restore ${id}` };
-  await fs.mkdir(join(tidyHome(options), 'saved'), { recursive: true });
-  await fs.appendFile(join(tidyHome(options), 'saved', 'index.jsonl'), JSON.stringify(record) + '\n');
+  if (!options.deferIndex) await recordSaved([record], options);
   return { saved: true, ...record };
+}
+
+async function recordSaved(records, options = {}) {
+  if (!records.length) return;
+  await fs.mkdir(join(tidyHome(options), 'saved'), { recursive: true });
+  await fs.appendFile(join(tidyHome(options), 'saved', 'index.jsonl'), records.map((r) => JSON.stringify(r) + '\n').join(''));
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Close: idle worktrees give their space back. Each one's leftovers go to the trash, its work is saved (one bundle
+// file per project per run), then git removes the folder. Never: the main checkout, the folder this runs in, a
+// locked worktree, one used within the idle limit, or one whose save could not be proven.
+// ---------------------------------------------------------------------------------------------------------------
+export async function closePlan(options = {}) {
+  const now = options.now ?? Date.now(), idleDays = options.idleDays ?? 1;
+  const here = resolve(options.cwd ?? process.cwd());
+  const projects = await unfinishedWork({ ...options, cwd: here });
+  const plan = [];
+  for (const p of projects) {
+    const common = resolve(p.main, git(['rev-parse', '--git-common-dir'], p.main));
+    const locked = new Set((git(['worktree', 'list', '--porcelain'], common) ?? '').split(/\r?\n\r?\n/).map((b) => b.split(/\r?\n/))
+      .filter((l) => l.some((x) => x.startsWith('locked'))).map((l) => resolve(l[0].slice(9))));
+    for (const f of p.folders) {
+      if (f.main) continue;
+      const why = inside(f.path, here) ? 'you are working in it' : locked.has(f.path) ? 'locked in git' : f.stage === 'unreadable' ? 'git cannot read it'
+        : f.idleDays < idleDays ? `used ${f.idleDays === 0 ? 'today' : `${f.idleDays} day(s) ago`}` : null;
+      plan.push({ project: p.name, common, path: f.path, branch: f.branch, stage: f.stage, madeBy: f.madeBy, idleDays: f.idleDays,
+        changed: f.changed, unpushed: f.unpushed, keep: why ?? null });
+    }
+  }
+  const candidates = plan.filter((x) => !x.keep);
+  await pool(candidates, 4, async (x) => { const m = await measure(x.path); x.bytes = m.bytes; x.freeable = m.freeable; });
+  return { idleDays, folders: plan, candidates, freeable: candidates.reduce((s, x) => s + (x.freeable ?? 0), 0), at: now };
+}
+
+export async function closeFolders(plan, options = {}) {
+  const receipt = { closed: [], failed: [], saved: [], bundles: [], freed: 0 };
+  const byProject = new Map();
+  for (const x of plan.candidates) {
+    try {
+      await prepareWorktree(x.path, { ...options, yes: true });
+      const saved = await saveFolder(x.path, { ...options, deferIndex: true });
+      if (!saved.saved && !/nothing here/.test(saved.reason)) throw new Error(`not saved: ${saved.reason}`);
+      if (saved.saved) { receipt.saved.push(saved); if (!byProject.has(x.common)) byProject.set(x.common, []); byProject.get(x.common).push(saved); }
+      // The save is proven; git removes the folder (forced: untracked and ignored files are saved or rebuilt).
+      if (git(['worktree', 'remove', '--force', x.path], x.common) === null || await lstat(x.path)) throw new Error('git could not remove the folder');
+      receipt.closed.push(x); receipt.freed += x.freeable ?? 0;
+    } catch (error) { receipt.failed.push({ path: x.path, error: String(error.message ?? error) }); }
+  }
+  // One file per project holding every commit saved in this run that no remote has.
+  for (const [common, records] of byProject) {
+    const name = slug(records[0].project), file = join(tidyHome(options), 'saved', `${name}-${stampOf(plan.at)}.bundle`);
+    const bundle = await writeBundle(common, records.map((r) => r.ref), file);
+    for (const r of records) r.bundle = bundle;
+    if (bundle) receipt.bundles.push(bundle);
+    await recordSaved(records, options);
+  }
+  return receipt;
+}
+
+export function formatClose(plan) {
+  const lines = [];
+  const kept = plan.folders.filter((x) => x.keep), go = plan.candidates;
+  if (!plan.folders.length) return 'No worktrees here. (The main checkout is never closed.)';
+  lines.push(`${go.length} idle worktree(s) can be closed, freeing about ${size(plan.freeable)}. Their work is saved first: ${go.filter((x) => x.stage === 'uncommitted' || x.stage === 'not pushed' || x.stage === 'no remote').length} hold unfinished work.`);
+  for (const x of go.sort((a, b) => (b.freeable ?? 0) - (a.freeable ?? 0)))
+    lines.push(`  ${size(x.freeable ?? 0).padStart(8)}  ${(x.branch ?? '(no branch)').slice(0, 40).padEnd(40)} ${x.stage.padEnd(12)} idle ${String(x.idleDays).padStart(3)} d  ${x.path}`);
+  if (kept.length) lines.push('', `Kept (${kept.length}):`, ...kept.map((x) => `  ${x.path}: ${x.keep}`));
+  return lines.join('\n');
 }
 
 /** One file holding the saved commits that exist nowhere else (commits already on a remote are left out). */
@@ -1010,7 +1086,7 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close'];
   const positional = argv.filter((a) => !a.startsWith('--'));
   if (!COMMANDS.includes(command) || (older && !(options.olderThanDays >= 1)) || (['prepare', 'save'].includes(command) && !options.project)
       || (command === 'restore' && !positional[1])) {
@@ -1033,6 +1109,24 @@ export async function main(argv) {
     if (args.has('--json')) { console.log(JSON.stringify(result, null, 2)); return; }
     if (!result.saved) { console.log(`${result.top}: not saved: ${result.reason}.`); return; }
     console.log(`Saved ${result.path} as ${result.id}.\n  Snapshot: ${result.ref}\n  Bundle: ${result.bundle ?? 'not written'}\n  Local files kept: ${result.kept ? `${result.kept.files} in ${result.kept.dir}` : 'none'}\n  Restore: ${result.restore}`);
+    return;
+  }
+  if (command === 'close') {
+    const idle = argv.find((a) => a.startsWith('--idle-days='));
+    const idleDays = idle ? Number(idle.split('=')[1]) : 1;
+    if (!(idleDays >= 0)) { console.error('--idle-days must be a number of days'); process.exitCode = 2; return; }
+    const plan = await closePlan({ ...options, idleDays, all: args.has('--all') });
+    if (!args.has('--yes')) {
+      console.log(args.has('--json') ? JSON.stringify(plan, null, 2) : formatClose(plan));
+      if (!args.has('--json') && plan.candidates.length) console.log('\nThis was a plan. Nothing was saved or removed. Run again with --yes to save the work and close them.');
+      return;
+    }
+    const receipt = await closeFolders(plan);
+    if (args.has('--json')) { console.log(JSON.stringify({ plan, receipt }, null, 2)); return; }
+    console.log(`Closed ${receipt.closed.length} worktree(s), about ${size(receipt.freed)} freed. Saved work from ${receipt.saved.length} of them.`);
+    for (const b of receipt.bundles) console.log(`  Saved work file: ${b}`);
+    if (receipt.saved.length) console.log('  List saved work: codein-tidy saved. Put one back: codein-tidy restore <id>.');
+    for (const f of receipt.failed) console.log(`  kept ${f.path}: ${f.error}`);
     return;
   }
   if (command === 'saved') {
