@@ -864,7 +864,7 @@ export function formatReport(plans, { cleaning = false } = {}) {
 /** Folders a package manager or a build fills again: never the only copy of anything. */
 const REBUILT_DIRS = new Set(['node_modules', '.venv', 'venv', '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache', 'target',
   'dist', 'build', '.next', '.turbo', 'out', 'coverage', '.cache', '.parcel-cache', '.svelte-kit', '.nuxt', '.gradle', '.pnpm-store',
-  '.yarn', '.expo', '.vercel', '.output', 'bower_components', '.terraform']);
+  '.yarn', '.expo', '.vercel', '.output', 'bower_components', '.terraform', '.vscode-test']);
 /** Single files a build or tool writes again. */
 const REBUILT_FILES = /(\.tsbuildinfo|\.pyc|\.pyo)$|^(\.eslintcache|\.stylelintcache|\.DS_Store|Thumbs\.db)$/i;
 const KEEP_FILE_LIMIT = 20 * 1024 ** 2, KEEP_TOTAL_LIMIT = 200 * 1024 ** 2;
@@ -1000,9 +1000,35 @@ export async function closePlan(options = {}) {
         changed: f.changed, unpushed: f.unpushed, keep: why ?? null });
     }
   }
-  const candidates = plan.filter((x) => !x.keep);
+  const candidates = [...plan.filter((x) => !x.keep), ...await closeLeftovers(options)];
   await pool(candidates, 4, async (x) => { const m = await measure(x.path); x.bytes = m.bytes; x.freeable = m.freeable; });
   return { idleDays, folders: plan, candidates, freeable: candidates.reduce((s, x) => s + (x.freeable ?? 0), 0), at: now };
+}
+
+/** A folder git has let go of (not listed, no .git file of its own): delete what is left. Node removes paths
+ * longer than Windows' limit and removes junctions without following them into what they point at. */
+async function finishLeftover(path, common) {
+  const listed = linkedWorktreesAll(common);
+  if ([listed.main, ...listed.linked.map((w) => w.path)].some((p) => resolve(p) === resolve(path))) return false;
+  if (await lstat(join(path, '.git'))) return false;
+  await fs.rm(path, { recursive: true, force: true, maxRetries: 3 });
+  return !await lstat(path);
+}
+
+/** Folders an earlier close saved but could not finish removing: saved, no longer known to git, still on disk. */
+async function closeLeftovers(options = {}) {
+  const out = [];
+  const closed = (await fs.readFile(join(tidyHome(options), 'closed.jsonl'), 'utf8').catch(() => '')).split('\n').filter(Boolean)
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } }).filter(Boolean).map((c) => ({ ...c, id: c.savedId }));
+  for (const r of [...await savedList(options), ...closed]) {
+    if (!r.common || out.some((x) => x.path === r.path) || !await lstat(r.path) || await lstat(join(r.path, '.git'))) continue;
+    try {
+      const listed = linkedWorktreesAll(r.common);
+      if ([listed.main, ...listed.linked.map((w) => w.path)].some((p) => resolve(p) === resolve(r.path))) continue;
+    } catch { continue; }
+    out.push({ project: r.project, common: r.common, path: r.path, branch: r.branch, stage: 'leftover', savedId: r.id, idleDays: 0, keep: null, leftover: true });
+  }
+  return out;
 }
 
 export async function closeFolders(plan, options = {}) {
@@ -1010,12 +1036,24 @@ export async function closeFolders(plan, options = {}) {
   const byProject = new Map();
   for (const x of plan.candidates) {
     try {
+      if (x.leftover) {
+        // Saved by an earlier close (x.savedId); git no longer knows it: only the files are left to delete.
+        if (!await finishLeftover(x.path, x.common)) throw new Error('could not delete the leftover files');
+        receipt.closed.push(x); receipt.freed += x.freeable ?? 0;
+        continue;
+      }
       await prepareWorktree(x.path, { ...options, yes: true });
       const saved = await saveFolder(x.path, { ...options, deferIndex: true });
       if (!saved.saved && !/nothing here/.test(saved.reason)) throw new Error(`not saved: ${saved.reason}`);
       if (saved.saved) { receipt.saved.push(saved); if (!byProject.has(x.common)) byProject.set(x.common, []); byProject.get(x.common).push(saved); }
+      // A record of every folder close lets go of, saved or not, so a later run can finish one git left behind.
+      await fs.mkdir(tidyHome(options), { recursive: true });
+      await fs.appendFile(join(tidyHome(options), 'closed.jsonl'), JSON.stringify({ path: x.path, common: x.common, savedId: saved.saved ? saved.id : null, at: new Date().toISOString() }) + '\n');
       // The save is proven; git removes the folder (forced: untracked and ignored files are saved or rebuilt).
-      if (git(['worktree', 'remove', '--force', x.path], x.common) === null || await lstat(x.path)) throw new Error('git could not remove the folder');
+      // On Windows git drops the worktree and then stops at "Filename too long" (deep node_modules paths), leaving
+      // files behind (2026-11-17: 26 of 42). Those are finished here, only once git no longer knows the folder.
+      if ((git(['worktree', 'remove', '--force', x.path], x.common) === null || await lstat(x.path)) && !await finishLeftover(x.path, x.common))
+        throw new Error('git could not remove the folder');
       receipt.closed.push(x); receipt.freed += x.freeable ?? 0;
     } catch (error) { receipt.failed.push({ path: x.path, error: String(error.message ?? error) }); }
   }
@@ -1033,8 +1071,10 @@ export async function closeFolders(plan, options = {}) {
 export function formatClose(plan) {
   const lines = [];
   const kept = plan.folders.filter((x) => x.keep), go = plan.candidates;
-  if (!plan.folders.length) return 'No worktrees here. (The main checkout is never closed.)';
-  lines.push(`${go.length} idle worktree(s) can be closed, freeing about ${size(plan.freeable)}. Their work is saved first: ${go.filter((x) => x.stage === 'uncommitted' || x.stage === 'not pushed' || x.stage === 'no remote').length} hold unfinished work.`);
+  if (!plan.folders.length && !plan.candidates.length) return 'No worktrees here. (The main checkout is never closed.)';
+  const leftovers = go.filter((x) => x.leftover).length;
+  lines.push(`${go.length - leftovers} idle worktree(s) can be closed, freeing about ${size(plan.freeable)}. Their work is saved first: ${go.filter((x) => x.stage === 'uncommitted' || x.stage === 'not pushed' || x.stage === 'no remote').length} hold unfinished work.` +
+    (leftovers ? ` Also ${leftovers} folder(s) an earlier close saved but could not finish deleting.` : ''));
   for (const x of go.sort((a, b) => (b.freeable ?? 0) - (a.freeable ?? 0)))
     lines.push(`  ${size(x.freeable ?? 0).padStart(8)}  ${(x.branch ?? '(no branch)').slice(0, 40).padEnd(40)} ${x.stage.padEnd(12)} idle ${String(x.idleDays).padStart(3)} d  ${x.path}`);
   if (kept.length) lines.push('', `Kept (${kept.length}):`, ...kept.map((x) => `  ${x.path}: ${x.keep}`));

@@ -817,3 +817,53 @@ test('every command runs through the real command line (sealed environment)', as
   }
   assert.match(run('slot', 'list').stdout, /cli-task/);
 });
+
+test('close finishes a folder git dropped but could not delete (Windows: path too long), now and from earlier runs', { skip: process.platform !== 'win32' }, async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), 'node_modules/\n'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const store = join(m.root, 'store', 'pkg'); await aged(join(store, 'i.js'), 0, 'shared');
+  const make = async (name) => {
+    const tree = join(m.root, 'wt', name);
+    g(['worktree', 'add', '-q', '-b', name, tree], repo);
+    await writeFile(join(tree, 'work.js'), name);
+    await mkdir(join(tree, 'node_modules'), { recursive: true });
+    const { symlink } = await import('node:fs/promises');
+    await symlink(store, join(tree, 'node_modules', 'pkg'), 'junction');
+    // Deeper than Windows' 260-character limit: git's own delete stops here.
+    let deep = join(tree, 'node_modules', 'deep'); for (let i = 0; i < 30; i++) deep = join(deep, 'segment');
+    await mkdir(deep, { recursive: true }); await writeFile(join(deep, 'f.txt'), 'x');
+    return tree;
+  };
+  const a = await make('a');
+  const plan = await closePlan({ ...m.options, cwd: repo, now: Date.now() + 3 * DAY });
+  const receipt = await closeFolders(plan, { home: m.home });
+  assert.deepEqual(receipt.failed, []);
+  assert.equal(await exists(a), false, 'finished after git stopped at the long path');
+  assert.equal(await exists(join(store, 'i.js')), true, 'the junction target is never followed');
+  assert.ok((await savedList({ home: m.home })).some((r) => r.path === a), 'its work was saved first');
+
+  // A leftover from an earlier run: saved, dropped by git, files still there.
+  const b = await make('b');
+  const saved = await saveFolder(b, { home: m.home });
+  // git stops at the long path, as on the founder's machine: it fails, drops the worktree, leaves the files.
+  assert.throws(() => g(['worktree', 'remove', '--force', b], repo));
+  assert.equal(await exists(b), true);
+  const again = await closePlan({ ...m.options, cwd: repo, home: m.home });
+  assert.deepEqual(again.candidates.filter((x) => x.leftover).map((x) => x.path), [b]);
+  assert.match(formatClose(again), /1 folder\(s\) an earlier close saved but could not finish deleting/);
+  const r2 = await closeFolders(again, { home: m.home });
+  assert.deepEqual(r2.failed, []);
+  assert.equal(await exists(b), false);
+  assert.equal(await exists(join(store, 'i.js')), true);
+  assert.ok(saved.saved);
+
+  // A clean folder (nothing to save) that git dropped half-way is finished too: close logged it before letting go.
+  const c = join(m.root, 'wt', 'c');
+  g(['worktree', 'add', '-q', '--detach', c, 'main'], repo);
+  let deep = join(c, 'node_modules', 'deep'); for (let i = 0; i < 30; i++) deep = join(deep, 'segment');
+  await mkdir(deep, { recursive: true }); await writeFile(join(deep, 'f.txt'), 'x');
+  const r3 = await closeFolders(await closePlan({ ...m.options, cwd: repo, home: m.home, now: Date.now() + 3 * DAY }), { home: m.home });
+  assert.deepEqual(r3.failed, []);
+  assert.equal(await exists(c), false);
+});
