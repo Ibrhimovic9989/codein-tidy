@@ -1,7 +1,7 @@
 {
   "name": "codein-tidy",
   "description": "See and safely free the disk space AI coding tools leave behind. Uncommitted work is never deleted.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "code.in"
   },

@@ -51,6 +51,18 @@ When you see unfinished work:
 2. For each folder the user wants finished, follow "Worktrees with uncommitted work" below to commit it.
 3. Ask the user before pushing or merging anything. Never delete, reset or stash the work.
 
+## Working folders
+
+- Do not run `git worktree add`. Take a folder from the project's pool:
+  `npx -y codein-tidy@latest slot take --branch=<name>`, and release it when the task ends:
+  `npx -y codein-tidy@latest slot release`. A refusal means the project is at its budget: release a slot or
+  offer the user `close`.
+- To free idle worktrees, show the user the plan first: `npx -y codein-tidy@latest close`. It saves every
+  folder's work (a snapshot commit plus ignored local files) into one file per project before git removes the
+  folder. Run it with `--yes` only after the user agrees. `codein-tidy saved` lists what was saved, and
+  `codein-tidy restore <id>` puts a folder back exactly.
+- `npx -y codein-tidy@latest deps` shows whether this project's installs are shared or copied, and the fix.
+
 ## Worktrees with uncommitted work
 
 Uncommitted work is never deleted. The report lists worktrees that "hold uncommitted work". Turn that work into
