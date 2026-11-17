@@ -10,29 +10,49 @@ This skill measures them and removes only what is safe.
 
 ## Steps
 
-One command does the whole job. You show the person the list; they choose; you apply their choice.
+One command does the whole job. The person decides; you do the work that needs judgment.
 
-1. Run it. It only reads, and prints a review list: every item with a name, its size and what will happen.
+1. Run it. It prints the scope choices and measures nothing yet:
 
    ```
    npx -y codein-tidy@latest
    ```
 
-2. Show the person the list as it printed. Items marked [x] are suggested; `history` deletes old chats for good,
-   so it is never suggested. Idle worktrees are saved (a snapshot commit of their work plus ignored local files,
-   in one file per project) before they are removed.
-
-3. Ask which items to free. Wait for the answer. Never choose for them.
-
-4. Run their choice, by name (or `suggested`, or `all`):
+   Ask the person which scope they want: this computer, named drives, or only this project. Never choose for
+   them. Then run it with their answer (this only reads):
 
    ```
-   npx -y codein-tidy@latest --apply=worktrees:my-app,caches,cleanup:claude-code
+   npx -y codein-tidy@latest --scope=computer        # or --scope=drive:C,D   or --scope=project
    ```
 
-   It scans again before acting and skips anything that changed.
+2. Read the list. "Ready to free" items free space now. "Not ready yet" are worktrees holding uncommitted work.
 
-5. Report the "Done. About ... freed" line exactly as printed, where the saved work is, and any item it kept.
+3. If any folder is not ready, tell the person, then do the task printed under "To the agent": for each folder,
+   read the work, commit the real work as the git identity that folder already has (never change git config,
+   never pass --author, never push), and record what it was:
+
+   ```
+   npx -y codein-tidy@latest record --project=<folder> --summary="<what this work was>" --relevant=<file,file|none|all>
+   ```
+
+   `--relevant` names the context and scratch files that matter for understanding the work. It is a label: every
+   file is still kept whole. Then run the scope command again; committed folders move to "Ready to free". The
+   tool checks each one against git: work that vanished without a commit is flagged, never called ready.
+
+4. Show the person the list as it printed. Items marked [x] are suggested; `history` deletes old chats for good,
+   so it is never suggested. Ask which items to free. Wait for the answer. Never choose for them.
+
+5. Run their choice, by name (or `suggested`, or `all`), with the same scope:
+
+   ```
+   npx -y codein-tidy@latest --scope=computer --apply=worktrees:my-app,caches,cleanup:claude-code
+   ```
+
+   It scans again before acting and skips anything that changed. Before a worktree is removed, everything only it
+   holds is saved into one file per project: its work, commits that exist nowhere else, local files git ignores,
+   and agent context and scratch files.
+
+6. Report the "Done. About ... freed" line exactly as printed, where the saved work is, and any item it kept.
    `codein-tidy saved` lists saved work; `codein-tidy restore <id>` puts a folder back exactly.
 
 ## Unfinished work

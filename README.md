@@ -9,12 +9,58 @@ Works with **Claude Code, Codex, Cursor and Antigravity** on Windows, macOS and 
 npx codein-tidy            # one command: review everything, choose, confirm once, done
 ```
 
-In a terminal it scans everything with a live progress bar, then shows one list: each item with its size and
-what will happen. Move with the arrow keys, Space selects, A selects all, Right shows the folders or files behind
-an item, Enter continues. You confirm once (Yes, back to the list, or quit), then it does it with a live bar:
-every idle worktree's work is saved into one file per project before the folder is removed, then caches, logs and
-leftovers are freed. Through an agent (no terminal) the same list is printed with a name per item; the agent shows it to
-you and runs your choice with `npx codein-tidy --apply=<names>` (or `--apply=suggested`, `--apply=all`).
+The one command is the whole job, in a terminal with the arrow keys or through your coding agent:
+
+1. **Where to look.** This computer, the drives you tick, or only this project.
+2. **Scan**, with a live progress bar.
+3. **Ready and not ready.** Ready items free space now. A worktree holding uncommitted work is not ready: a
+   coding agent should read that work and commit it first.
+4. **Hand-off.** From the same screen, hand those folders to an agent installed on your machine (Claude Code,
+   code.in and OpenCode are tested; Codex is wired but not yet tested here), or copy the task for your own agent.
+   Each folder is checked afterwards and the list updates by itself, also when your agent commits in another
+   window.
+5. **Choose and confirm once.** Space selects, A selects all, Right shows what is behind an item. The confirm
+   screen names the file each project's work is saved into.
+6. **Save, then free**, with a live bar.
+
+Through an agent (no terminal) the same steps are printed as text: the scope question first
+(`--scope=computer`, `--scope=drive:C,D`, `--scope=project`), then the list with a name per item and the task
+for the folders that are not ready. The agent runs your choice with `npx codein-tidy --scope=... --apply=<names>`.
+
+## How commits are handled
+
+Projects use different git and GitHub accounts, so commits are never made in a guessed name.
+
+- The tool itself never commits your work. Its saves are snapshots under its own name (`codein-tidy`), kept
+  under `refs/tidy` and in a bundle file; they are local saves, never pushed.
+- The agent is told to commit as the git identity each folder already has (shown per folder), never to change
+  git config, never to pass `--author`, and never to push.
+- Afterwards every folder is checked against git itself. Work that vanished without a commit (a stash, a reset)
+  is flagged and the folder is not called ready. A commit made as another account, or one that was pushed, is
+  said out loud.
+- A folder changed in the last two hours is treated as in use: it is shown, never offered.
+
+## What is saved, and where
+
+Before a worktree is removed, everything only that folder holds goes into **one file per project per run**
+(`~/.codein-tidy/saved/<project>-<time>.bundle`, a git bundle: compressed, and a file shared by many folders is
+stored once), with one line per folder in `~/.codein-tidy/saved/index.jsonl`. Each part is labelled:
+
+| Part | What it is |
+|---|---|
+| work | uncommitted changes and new files, as a snapshot commit that holds work only |
+| commits | commits that exist on no remote |
+| local | files git ignores that only this folder has, such as `.env.local` |
+| context | what agents kept here (`.claude`, `.codex`, `.code-in`, ...) |
+| scratch | temp scripts, screenshots, probe files |
+
+Rebuildable folders (`node_modules`, build output, caches) are left out. A context or scratch file over 20 MB,
+or beyond 200 MB per folder, is left out too and named in the record, so nothing goes missing silently.
+
+**The agent's review is a label, never a filter.** `codein-tidy record --project=<folder> --summary="..."
+--relevant=<files|none|all>` lets the agent say what the work was and which context files matter. A summary can
+lose something, so it never replaces a file: every file is still stored whole, and the summary and the
+`relevant` marks sit on top as an index. `codein-tidy restore <id>` puts a folder back exactly.
 
 ```
 npx codein-tidy work       # unfinished work in this project, from every tool: reads only
@@ -52,8 +98,8 @@ commands keep a project's disk use tied to how many agents work on it at once, n
 
 | Command | What it does |
 |---|---|
-| `save --project=PATH [--yes]` | Saves a folder's work exactly: a snapshot commit (built without touching your branch, index or hooks), plus ignored local files like `.env.local` in a keep folder. `saved` lists saves; `restore ID` puts one back. |
-| `close [--all] [--idle-days=N] [--yes]` | For every idle worktree (default: untouched for a day): leftovers to trash, work saved into one file per project, then git removes the folder. Never the main checkout, the folder you are in, or a locked worktree. |
+| `save --project=PATH [--yes]` | Saves a folder exactly, into one bundle file: a snapshot commit of its work (built without touching your branch, index or hooks) and a second commit with ignored local files, agent context and scratch. `saved` lists saves; `restore ID` puts one back. |
+| `close [--all] [--idle-days=N] [--yes]` | For every idle worktree (default: untouched for a day): everything only that folder holds is saved into one file per project, then git removes the folder. Never the main checkout, the folder you are in, or a locked worktree. |
 | `slot take --branch=X` / `slot release` / `slot list` | A small pool of working folders per project (budget 3, or `"budget"` in `.codein-tidy.json`), reused across tasks: installed dependencies stay, work left in a slot is saved first. |
 | `deps` | Proves which installs are shared with a store and which are private copies, with the cause and the fix (for example: npm has no shared store; pnpm's store is on another drive). |
 | `guard [--mode=notify\|close]`, `guard --install [--dry-run]` | A daily job (Task Scheduler, launchd or cron) that keeps every known project inside its budget. `notify` only reports; `close` saves and closes the oldest idle worktrees. |
@@ -142,6 +188,7 @@ is on its way).
 | `clean` | Shows the plan. Add `--yes` to carry it out. |
 | `review` | Lists worktrees holding uncommitted work, split into real work and agent leftovers. |
 | `prepare --project=PATH` | Moves a worktree's agent leftovers to trash and ignores agent state locally. Add `--yes`. |
+| `record --project=PATH --summary="..." [--relevant=files\|none\|all]` | An agent's review of a folder, stored with its work when the folder is saved. |
 | `save`, `saved`, `restore`, `close`, `slot`, `deps`, `guard`, `rules` | See "Keep projects lean" above. |
 
 ## Why

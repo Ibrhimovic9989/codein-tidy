@@ -12,10 +12,10 @@
  *   4. App caches are skipped while that app is running.
  *   5. Nothing outside the listed folders is touched; symlinks are never followed.
  */
-import { promises as fs, copyFileSync } from 'node:fs';
+import { promises as fs, copyFileSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir, platform } from 'node:os';
 import { basename, join, resolve, sep } from 'node:path';
-import { execFile, execFileSync } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 
 const DAY = 24 * 60 * 60_000;
@@ -364,7 +364,7 @@ export async function unfinishedWork(options = {}) {
       const touched = Math.max(Number(when) * 1000, await newest(f.path, 1));
       const stage = work.length ? 'uncommitted' : !hasRemote ? 'no remote' : unpushed > 0 ? 'not pushed' : merged === false ? 'not merged' : merged ? 'in release' : 'pushed';
       return { ...f, madeBy: madeBy(f.path, f.main), stage, changed: work.length, sample: work.slice(0, 5), leftovers, unpushed: unpushed ?? 0,
-        idleDays: Math.max(0, Math.floor(((options.now ?? Date.now()) - touched) / DAY)), lastCommit: subject };
+        touched, idleDays: Math.max(0, Math.floor(((options.now ?? Date.now()) - touched) / DAY)), lastCommit: subject };
     });
     projects.push({ name: basename(main), main, release, hasRemote, live: 'not checked', budget: await projectBudget(main), folders: rows });
   }
@@ -756,7 +756,8 @@ export async function scan(options = {}) {
   const running = options.running ?? runningApps(options.os);
   const opts = { ...options, now, running, worktrees: options.worktrees || options.deep };
   // Package caches are always reported; they are cleaned only with --caches or --deep (see plan()).
-  const all = [...targets(options), ...await gitWorktreeTargets(options), ...cacheTargets(options)];
+  const all = [...targets(options), ...await gitWorktreeTargets(options), ...cacheTargets(options)]
+    .filter((t) => !options.drives || !t.path || options.drives.includes(driveOf(t.path)));
   // An agent reads this through a pipe, where the live progress line never shows: say once that work is under way.
   if (!process.stderr.isTTY && !process.env.CODEIN_TIDY_PROFILE) process.stderr.write(`codein-tidy: measuring ${all.length} places...\n`);
   let finished = 0;
@@ -877,7 +878,7 @@ const stampOf = (now) => new Date(now).toISOString().replace(/[:.]/g, '-');
 const sha256 = async (path) => createHash('sha256').update(await fs.readFile(path)).digest('hex');
 
 /** The tree of a folder exactly as it is now, built in a throwaway index. Null if git cannot build it. */
-function folderTree(top, excluded = []) {
+function folderTree(top, excluded = [], drop = []) {
   // The throwaway index lives in the checkout's own git folder: it always exists and is on the same drive.
   const gitDir = git(['rev-parse', '--absolute-git-dir'], top);
   if (!gitDir) return null;
@@ -894,6 +895,14 @@ function folderTree(top, excluded = []) {
       if ((head ? git(['read-tree', head], top, env) : git(['read-tree', '--empty'], top, env)) === null) return null;
     }
     if (git(['add', '-A', '--', '.', ...excluded.map((dir) => `:(exclude)${dir}`)], top, env) === null) return null;
+    if (drop.length) {
+      // Thousands of scratch files are common, so their names go through a file, not the command line.
+      const list = `${scratch}.paths`;
+      try {
+        writeFileSync(list, drop.join(String.fromCharCode(0)));
+        if (git(['--literal-pathspecs', 'rm', '--cached', '-q', '--ignore-unmatch', `--pathspec-from-file=${list}`, '--pathspec-file-nul'], top, env) === null) return null;
+      } finally { rmSync(list, { force: true }); }
+    }
     return git(['write-tree'], top, env);
   } finally { fs.rm(scratch, { force: true }).catch(() => {}); }
 }
@@ -901,8 +910,8 @@ function folderTree(top, excluded = []) {
 /** Ignored files only this folder has: everything git ignores except rebuilt folders, agent state and leftovers. */
 async function ignoredToKeep(top, stateDirs) {
   const raw = git(['ls-files', '--others', '--ignored', '--exclude-standard', '--directory', '-z'], top, undefined, true) ?? '';
-  const skip = (rel) => rel.split('/').some((part) => REBUILT_DIRS.has(part) || AGENT_STATE_DIRS.includes(part)) || REBUILT_FILES.test(rel.split('/').pop())
-    || stateDirs.some((dir) => rel === dir || rel.startsWith(dir + '/')) || PROJECT_JUNK.some((rule) => rule.test(rel));
+  const skip = (rel) => rel.split('/').some((part) => REBUILT_DIRS.has(part)) || REBUILT_FILES.test(rel.split('/').pop())
+    || stateDirs.some((dir) => rel === dir || rel.startsWith(dir + '/'));
   const files = [];
   async function walk(rel) {
     if (skip(rel)) return;
@@ -915,22 +924,106 @@ async function ignoredToKeep(top, stateDirs) {
   return files;
 }
 
+/** Files in agent state folders git does not track (.claude, .code-in, ...): the context an agent left here. */
+async function stateFilesOf(top, stateDirs) {
+  const files = [];
+  async function walk(rel) {
+    const full = join(top, rel), stat = await lstat(full);
+    if (!stat || stat.isSymbolicLink()) return;
+    if (stat.isDirectory()) { if (REBUILT_DIRS.has(rel.split('/').pop())) return; for (const name of await fs.readdir(full).catch(() => [])) await walk(`${rel}/${name}`); return; }
+    files.push({ rel, bytes: stat.size });
+  }
+  for (const dir of stateDirs) await walk(dir);
+  return files;
+}
+
+// Agent context and scratch: saved when they fit, never a reason to refuse a save.
+const isAgentState = (rel) => rel.split('/').some((part) => AGENT_STATE_DIRS.includes(part)) || PROJECT_JUNK.some((rule) => rule.test(rel));
+
+/**
+ * One commit holding files git would never keep: ignored local files (.env.local) and agent context. It is
+ * built in a throwaway index, so the folder, its index and its branch are untouched. Null if git cannot.
+ */
+async function extrasCommit(top, rels, message, ident) {
+  const gitDir = git(['rev-parse', '--absolute-git-dir'], top);
+  if (!gitDir) return null;
+  const scratch = join(gitDir, `codein-tidy-extras-${process.pid}-${randomUUID()}`), list = `${scratch}.paths`;
+  const env = { GIT_INDEX_FILE: scratch };
+  try {
+    await fs.writeFile(list, rels.join(String.fromCharCode(0)));
+    if (git(['read-tree', '--empty'], top, env) === null) return null;
+    if (git(['--literal-pathspecs', 'add', '-f', `--pathspec-from-file=${list}`, '--pathspec-file-nul'], top, env) === null) return null;
+    const stored = (git(['ls-files', '-z'], top, env, true) ?? '').split(String.fromCharCode(0)).filter(Boolean).length;
+    if (stored !== rels.length) return null; // every file, or nothing: a partial save is never called a save
+    const tree = git(['write-tree'], top, env);
+    return tree ? git(['commit-tree', tree, '-m', message], top, ident) : null;
+  } finally { fs.rm(scratch, { force: true }).catch(() => {}); fs.rm(list, { force: true }).catch(() => {}); }
+}
+
+const recordsFile = (options = {}) => join(tidyHome(options), 'records.json');
+async function readRecords(options = {}) { try { return JSON.parse(await fs.readFile(recordsFile(options), 'utf8')); } catch { return {}; } }
+
+/**
+ * An agent's review of a working folder, kept until the folder is saved: what the work was, and which context
+ * and scratch files are worth keeping (`relevant`: a list of paths, 'all' or 'none'). Judgment comes from the
+ * agent; this only checks it against the folder and stores it.
+ */
+export async function recordReview(path, { summary, relevant } = {}, options = {}) {
+  const top = git(['rev-parse', '--show-toplevel'], path);
+  if (!top) throw new Error(`${path} is not inside a git worktree`);
+  const text = String(summary ?? '').trim();
+  if (!text) throw new Error('a summary is needed: one or two sentences saying what this work was');
+  let list = relevant === undefined || relevant === 'all' ? 'all' : relevant === 'none' ? [] : relevant;
+  if (Array.isArray(list)) {
+    const missing = [];
+    list = list.map((r) => String(r).trim().split(String.fromCharCode(92)).join('/').replace(/^[.][/]/, '')).filter(Boolean);
+    for (const r of list) if (!inside(resolve(top), resolve(top, r)) || !await lstat(join(top, r))) missing.push(r);
+    if (missing.length) throw new Error(`not found in this folder: ${missing.join(', ')}`);
+  }
+  const all = await readRecords(options);
+  all[resolve(top)] = { summary: text.slice(0, 2000), relevant: list, at: new Date(options.now ?? Date.now()).toISOString() };
+  await fs.mkdir(tidyHome(options), { recursive: true });
+  await fs.writeFile(recordsFile(options), JSON.stringify(all, null, 2));
+  return { path: resolve(top), ...all[resolve(top)] };
+}
+
 /** What saving a folder would do, without doing it. */
-export async function savePlan(path) {
+export async function savePlan(path, options = {}) {
   const top = git(['rev-parse', '--show-toplevel'], path);
   if (!top) throw new Error(`${path} is not inside a git worktree`);
   const changes = classifyChanges(top);
   const head = git(['rev-parse', '--verify', '--quiet', 'HEAD'], top);
   const branch = git(['symbolic-ref', '--quiet', '--short', 'HEAD'], top) || null;
-  const tree = folderTree(top, changes.state);
+  const tree = folderTree(top, changes.state, changes.leftovers);
   if (!tree) throw new Error(`git could not read ${top}`);
   const headTree = head ? git(['rev-parse', `${head}^{tree}`], top) : null;
   const kept = head ? Boolean(git(['for-each-ref', '--count=1', '--contains', head, '--format=%(refname)', 'refs/heads', 'refs/remotes', 'refs/tags'], top)) : false;
-  const keep = await ignoredToKeep(top, changes.state);
+  const ignored = await ignoredToKeep(top, changes.state);
+  const keep = ignored.filter((f) => !isAgentState(f.rel));
   const keepBytes = keep.reduce((sum, f) => sum + f.bytes, 0);
   const tooBig = keep.filter((f) => f.bytes > KEEP_FILE_LIMIT).map((f) => f.rel);
+  // Agent context and scratch. Each file is labelled by what it is. An agent that reviewed this folder
+  // (codein-tidy record) has said which of them matter; that is a label, never a reason to drop a file: a
+  // summary or a relevance call can be wrong, so the originals stay, whole, in the compressed archive. The only
+  // files left out are ones too large to keep, and each of those is named in the record.
+  const scratchFiles = [];
+  for (const rel of changes.leftovers) { const stat = await lstat(join(top, rel)); if (stat?.isFile()) scratchFiles.push({ rel, bytes: stat.size }); }
+  const isScratch = (rel) => PROJECT_JUNK.some((rule) => rule.test(rel));
+  const soft = [...ignored.filter((f) => isAgentState(f.rel)), ...await stateFilesOf(top, changes.state), ...scratchFiles]
+    .map((f) => ({ ...f, role: isScratch(f.rel) ? 'scratch' : 'context' }));
+  const decision = (await readRecords(options))[resolve(top)] ?? null;
+  const wanted = (rel) => !decision || decision.relevant === 'all' || (Array.isArray(decision.relevant)
+    && decision.relevant.some((r) => rel === r || rel.startsWith(r.replace(/[/]+$/, '') + '/')));
+  const context = [], skipped = [];
+  let room = Math.max(0, KEEP_TOTAL_LIMIT - keepBytes);
+  // Files the agent called relevant take the room first.
+  for (const f of [...soft.filter((f) => wanted(f.rel)), ...soft.filter((f) => !wanted(f.rel))]) {
+    if (f.bytes > KEEP_FILE_LIMIT || f.bytes > room) { skipped.push({ rel: f.rel, bytes: f.bytes, role: f.role }); continue; }
+    context.push({ ...f, relevant: decision ? wanted(f.rel) : null }); room -= f.bytes;
+  }
   return { top: resolve(top), head, branch, tree, headTree, changed: tree !== headTree, unreferenced: Boolean(head) && !kept,
-    work: changes.work.length, leftovers: changes.leftovers.length, state: changes.state, keep, keepBytes,
+    work: changes.work.length, leftovers: changes.leftovers.length, leftoverFiles: changes.leftovers, state: changes.state, keep, keepBytes, context, skipped,
+    summary: decision?.summary ?? null, reviewed: Boolean(decision),
     blocked: tooBig.length ? `ignored files too large to keep: ${tooBig.slice(0, 3).join(', ')}` : keepBytes > KEEP_TOTAL_LIMIT ? `ignored files to keep total ${size(keepBytes)}` : null };
 }
 
@@ -940,14 +1033,16 @@ export async function savePlan(path) {
  */
 export async function saveFolder(path, options = {}) {
   const now = options.now ?? Date.now();
-  const p = await savePlan(path);
+  const p = await savePlan(path, options);
   if (p.blocked) return { saved: false, reason: p.blocked, top: p.top };
-  if (!p.changed && !p.unreferenced && !p.keep.length) return { saved: false, reason: 'nothing here that is not already in git', top: p.top };
+  const extraFiles = [...p.keep.map((f) => ({ ...f, role: 'local' })), ...p.context];
+  if (!p.changed && !p.unreferenced && !extraFiles.length) return { saved: false, reason: 'nothing here that is not already in git', top: p.top };
   const common = resolve(p.top, git(['rev-parse', '--git-common-dir'], p.top));
   const name = basename(p.top), id = `${stampOf(now)}-${slug(name)}-${randomUUID().slice(0, 6)}`;
   let snapshot = p.head;
+  // Snapshots carry codein-tidy's own name, never a person's account: they are local saves, not authored work.
+  const ident = { GIT_AUTHOR_NAME: 'codein-tidy', GIT_AUTHOR_EMAIL: 'codein-tidy@localhost', GIT_COMMITTER_NAME: 'codein-tidy', GIT_COMMITTER_EMAIL: 'codein-tidy@localhost' };
   if (p.changed || !p.head) {
-    const ident = { GIT_AUTHOR_NAME: 'codein-tidy', GIT_AUTHOR_EMAIL: 'codein-tidy@localhost', GIT_COMMITTER_NAME: 'codein-tidy', GIT_COMMITTER_EMAIL: 'codein-tidy@localhost' };
     const message = `codein-tidy snapshot of ${p.top}${p.branch ? ` (branch ${p.branch})` : ''}\n\n${p.work} uncommitted change(s) saved on ${new Date(now).toISOString()}.`;
     snapshot = git(['commit-tree', p.tree, ...(p.head ? ['-p', p.head] : []), '-m', message], p.top, ident);
     if (!snapshot) throw new Error('git could not write the snapshot commit');
@@ -955,21 +1050,28 @@ export async function saveFolder(path, options = {}) {
   const ref = `refs/tidy/${slug(name)}/${id}`;
   if (git(['update-ref', ref, snapshot], p.top) === null) throw new Error('git could not record the snapshot');
   // Proof: the folder still equals what was saved (nothing changed while saving).
-  if (folderTree(p.top, p.state) !== p.tree) throw new Error('the folder changed while it was being saved; nothing was released, run again');
-  const keepDir = join(tidyHome(options), 'kept', id), kept = [];
-  for (const f of p.keep) {
-    const from = join(p.top, f.rel), to = join(keepDir, f.rel);
-    await fs.mkdir(join(to, '..'), { recursive: true });
-    await fs.copyFile(from, to);
-    const hash = await sha256(from);
-    if (hash !== await sha256(to)) throw new Error(`could not copy ${f.rel} exactly`);
-    kept.push({ rel: f.rel, bytes: f.bytes, sha256: hash });
+  if (folderTree(p.top, p.state, p.leftoverFiles) !== p.tree) throw new Error('the folder changed while it was being saved; nothing was released, run again');
+  // Files git would never keep (ignored local files, agent context) go into a second commit, so one bundle
+  // file holds everything this folder had. Each file's hash is recorded to prove a restore later.
+  let extras = null;
+  if (extraFiles.length) {
+    const commit = await extrasCommit(p.top, extraFiles.map((f) => f.rel),
+      `codein-tidy extras of ${p.top}\n\n${p.keep.length} local file(s) git ignores and ${p.context.length} agent context and scratch file(s), saved on ${new Date(now).toISOString()}.`, ident);
+    if (!commit) throw new Error('git could not save the local and context files');
+    const extrasRef = `${ref}-extras`;
+    if (git(['update-ref', extrasRef, commit], p.top) === null) throw new Error('git could not record the local and context files');
+    const files = [];
+    for (const f of extraFiles) files.push({ rel: f.rel, role: f.role, ...(f.relevant === undefined ? {} : { relevant: f.relevant }), bytes: f.bytes, sha256: await sha256(join(p.top, f.rel)) });
+    extras = { ref: extrasRef, commit, files, bytes: files.reduce((s, f) => s + f.bytes, 0) };
   }
-  if (kept.length) await fs.writeFile(join(keepDir, 'manifest.json'), JSON.stringify({ id, files: kept }, null, 2));
   // close writes one bundle per project for the whole run (deferIndex), save writes one per folder.
-  const bundle = options.deferIndex ? null : await writeBundle(p.top, [ref], join(tidyHome(options), 'saved', `${slug(name)}-${id}.bundle`));
+  const bundle = options.deferIndex ? null : await writeBundle(p.top, [ref, ...(extras ? [extras.ref] : [])], join(tidyHome(options), 'saved', `${slug(name)}-${id}.bundle`));
   const record = { id, project: name, common, path: p.top, branch: p.branch, head: p.head, snapshot, tree: p.tree, ref, bundle,
-    kept: kept.length ? { dir: keepDir, files: kept.length, bytes: kept.reduce((s, f) => s + f.bytes, 0) } : null, work: p.work, savedAt: new Date(now).toISOString(),
+    extras, work: p.work, savedAt: new Date(now).toISOString(),
+    // The standard record of one piece of work: who made it, what it was, and each part by what it is.
+    madeBy: madeBy(p.top), summary: p.summary, reviewed: p.reviewed,
+    parts: { work: p.work, local: p.keep.length, context: p.context.filter((f) => f.role === 'context').length,
+      scratch: p.context.filter((f) => f.role === 'scratch').length, relevant: p.reviewed ? p.context.filter((f) => f.relevant).length : null, tooLarge: p.skipped },
     restore: `npx codein-tidy restore ${id}` };
   if (!options.deferIndex) await recordSaved([record], options);
   return { saved: true, ...record };
@@ -1000,7 +1102,7 @@ export async function closePlan(options = {}) {
       const why = inside(f.path, here) ? 'you are working in it' : locked.has(f.path) ? 'locked in git' : f.stage === 'unreadable' ? 'git cannot read it'
         : f.idleDays < idleDays ? `used ${f.idleDays === 0 ? 'today' : `${f.idleDays} day(s) ago`}` : null;
       plan.push({ project: p.name, common, path: f.path, branch: f.branch, stage: f.stage, madeBy: f.madeBy, idleDays: f.idleDays,
-        changed: f.changed, unpushed: f.unpushed, keep: why ?? null });
+        changed: f.changed, unpushed: f.unpushed, touched: f.touched, sample: f.sample ?? [], keep: why ?? null });
     }
   }
   const candidates = [...plan.filter((x) => !x.keep), ...await closeLeftovers(options)];
@@ -1039,7 +1141,7 @@ async function closeLeftovers(options = {}) {
 
 export async function closeFolders(plan, options = {}) {
   const receipt = { closed: [], failed: [], saved: [], bundles: [], freed: 0 };
-  const byProject = new Map();
+  const byProject = new Map(), projectNames = new Map();
   let done = 0;
   for (const x of plan.candidates) {
     options.onStep?.({ done: done++, total: plan.candidates.length, note: x.path });
@@ -1050,10 +1152,9 @@ export async function closeFolders(plan, options = {}) {
         receipt.closed.push(x); receipt.freed += x.freeable ?? 0;
         continue;
       }
-      await prepareWorktree(x.path, { ...options, yes: true });
       const saved = await saveFolder(x.path, { ...options, deferIndex: true });
       if (!saved.saved && !/nothing here/.test(saved.reason)) throw new Error(`not saved: ${saved.reason}`);
-      if (saved.saved) { receipt.saved.push(saved); if (!byProject.has(x.common)) byProject.set(x.common, []); byProject.get(x.common).push(saved); }
+      if (saved.saved) { receipt.saved.push(saved); if (!byProject.has(x.common)) byProject.set(x.common, []); byProject.get(x.common).push(saved); if (x.project) projectNames.set(x.common, x.project); }
       // A record of every folder close lets go of, saved or not, so a later run can finish one git left behind.
       await fs.mkdir(tidyHome(options), { recursive: true });
       await fs.appendFile(join(tidyHome(options), 'closed.jsonl'), JSON.stringify({ path: x.path, common: x.common, savedId: saved.saved ? saved.id : null, at: new Date().toISOString() }) + '\n');
@@ -1067,8 +1168,8 @@ export async function closeFolders(plan, options = {}) {
   }
   // One file per project holding every commit saved in this run that no remote has.
   for (const [common, records] of byProject) {
-    const name = slug(records[0].project), file = join(tidyHome(options), 'saved', `${name}-${stampOf(plan.at)}.bundle`);
-    const bundle = await writeBundle(common, records.map((r) => r.ref), file);
+    const name = slug(projectNames.get(common) ?? records[0].project), file = join(tidyHome(options), 'saved', `${name}-${stampOf(plan.at)}.bundle`);
+    const bundle = await writeBundle(common, records.flatMap((r) => [r.ref, ...(r.extras ? [r.extras.ref] : [])]), file);
     for (const r of records) r.bundle = bundle;
     if (bundle) receipt.bundles.push(bundle);
     await recordSaved(records, options);
@@ -1118,6 +1219,18 @@ export async function restoreSaved(id, options = {}) {
   if (git(['worktree', 'add', ...(branchFree ? [to, record.branch] : ['--detach', to, base])], record.common) === null) throw new Error(`git could not create ${to}`);
   if (record.snapshot !== record.head && git(['restore', `--source=${record.snapshot}`, '--worktree', '--', '.'], to) === null)
     throw new Error('git could not put the saved changes back');
+  if (record.extras) {
+    if (git(['cat-file', '-e', `${record.extras.commit}^{commit}`], record.common) === null
+      && (!record.bundle || git(['fetch', '--quiet', record.bundle, `${record.extras.ref}:${record.extras.ref}`], record.common) === null))
+      throw new Error('the saved local and context files are missing from the repository and its bundle could not be read');
+    const gitDir = git(['rev-parse', '--absolute-git-dir'], to);
+    const scratch = join(gitDir, `codein-tidy-extras-${process.pid}-${randomUUID()}`), env = { GIT_INDEX_FILE: scratch };
+    try {
+      if (git(['read-tree', record.extras.commit], to, env) === null || git(['checkout-index', '-a', '-f'], to, env) === null)
+        throw new Error('git could not put the saved local and context files back');
+    } finally { await fs.rm(scratch, { force: true }).catch(() => {}); }
+    for (const f of record.extras.files) if (await sha256(join(to, f.rel)).catch(() => null) !== f.sha256) throw new Error(`saved file ${f.rel} did not restore exactly`);
+  }
   if (record.kept) {
     const manifest = JSON.parse(await fs.readFile(join(record.kept.dir, 'manifest.json'), 'utf8'));
     for (const f of manifest.files) {
@@ -1127,7 +1240,8 @@ export async function restoreSaved(id, options = {}) {
       if (await sha256(target) !== f.sha256) throw new Error(`kept file ${f.rel} did not restore exactly`);
     }
   }
-  const tree = folderTree(to, classifyChanges(to).state);
+  const restoredChanges = classifyChanges(to);
+  const tree = folderTree(to, restoredChanges.state, restoredChanges.leftovers);
   return { restored: tree === record.tree, path: to, branch: branchFree ? record.branch : null, tree, expected: record.tree };
 }
 
@@ -1490,47 +1604,197 @@ export async function guardUninstall(options = {}) {
 const sumFree = (list) => list.reduce((s, x) => s + (x.freeable ?? 0), 0);
 const planFree = (p) => p.removable.reduce((s, e) => s + (e.freeable ?? 0), 0);
 
+// A folder changed in the last two hours may have an agent working in it right now: it is shown, never offered.
+const IN_USE_MS = 2 * 60 * 60_000, HANDOFF_DAYS = 7;
+const handoffFile = (options = {}) => join(tidyHome(options), 'handoff.json');
+async function readHandoff(options = {}) { try { return JSON.parse(await fs.readFile(handoffFile(options), 'utf8')); } catch { return {}; } }
+async function writeHandoff(map, options = {}) { await fs.mkdir(tidyHome(options), { recursive: true }); await fs.writeFile(handoffFile(options), JSON.stringify(map, null, 2)); }
+
+/** The drives of this computer and their free space. Windows only; elsewhere the list is empty. */
+export async function listDrives(options = {}) {
+  if (options.driveList) return options.driveList;
+  if ((options.os ?? platform()) !== 'win32') return [];
+  const out = [];
+  for (const letter of 'CDEFGHIJKLMNOPQRSTUVWXYZ') {
+    try { const s = await fs.statfs(`${letter}:/`); if (s.blocks) out.push({ drive: `${letter}:`, free: s.bavail * s.bsize, total: s.blocks * s.bsize }); } catch {}
+  }
+  return out;
+}
+
+/** --scope=computer | project | drive:C,D */
+export function parseScope(text) {
+  const t = String(text ?? '').trim().toLowerCase();
+  if (t === 'computer' || t === 'all') return { kind: 'computer' };
+  if (t === 'project') return { kind: 'project' };
+  const m = /^drives?[:=](.+)$/.exec(t);
+  const drives = m ? m[1].split(/[,\s]+/).filter((d) => /^[a-z]:?$/.test(d)).map((d) => `${d[0].toUpperCase()}:`) : [];
+  return drives.length ? { kind: 'drives', drives: [...new Set(drives)] } : null;
+}
+export const scopeFlag = (scope) => scope.kind === 'drives' ? `drive:${scope.drives.map((d) => d[0]).join(',')}` : scope.kind;
+const scopeTitle = (scope, top) => scope.kind === 'computer' ? 'on this computer' : scope.kind === 'drives' ? `on drive${scope.drives.length > 1 ? 's' : ''} ${scope.drives.join(', ')}` : `in this project (${resolve(top)})`;
+
+/** The git account a folder commits as: read from git itself, never guessed, never changed. */
+function identityOf(path) {
+  const remote = git(['remote', 'get-url', 'origin'], path) || null;
+  return { name: git(['config', 'user.name'], path) || null, email: git(['config', 'user.email'], path) || null,
+    remote: remote ? remote.replace(/\/\/[^@/]+@/, '//') : null }; // never show a token kept in the URL
+}
+const identityLine = (who) => who.email ? `commits as ${who.name ?? '(no name)'} <${who.email}>${who.remote ? `, remote ${who.remote}` : ''}` : 'no git identity is set for this folder';
+const folderName = (x) => x.branch ?? basename(resolve(x.path, '..'));
+const workLabel = (x) => `${folderName(x)} (${x.project}): ${x.changed} uncommitted file(s), a coding agent should commit them first`;
+
+/**
+ * Everything the one command can do, in three groups:
+ *   ready      frees space now (worktrees are saved first, always)
+ *   not ready  worktrees holding uncommitted work: a coding agent should read and commit it first
+ *   kept       in use, locked, or the folder this runs in
+ * `options.scope`: { kind: 'computer' } (default), { kind: 'drives', drives: ['D:'] } or { kind: 'project' }.
+ */
 export async function guidedPlan(options = {}) {
   const cwd = resolve(options.cwd ?? process.cwd());
   const now = options.now ?? Date.now();
-  const scanned = await scan({ ...options, cwd, history: true, caches: true, worktrees: false });
-  const items = [], notes = [];
-  options.onStatus?.({ label: 'Checking idle worktrees', done: 0, total: 0 });
-  const close = await closePlan({ ...options, cwd, all: true, now });
+  const scope = options.scope ?? { kind: 'computer' };
+  const top = git(['rev-parse', '--show-toplevel'], cwd);
+  if (scope.kind === 'project' && !top) throw new Error(`${cwd} is not inside a git project: choose the computer or a drive instead`);
+  const onScope = (path) => scope.kind !== 'drives' || scope.drives.includes(driveOf(path));
+  const scanned = scope.kind === 'project' ? []
+    : await scan({ ...options, cwd, history: true, caches: true, worktrees: false, ...(scope.kind === 'drives' ? { drives: scope.drives } : {}) });
+  const items = [], notes = [], kept = [];
+  options.onStatus?.({ label: 'Checking worktrees and their work', done: 0, total: 0 });
+  const close = await closePlan({ ...options, cwd, all: scope.kind !== 'project', now });
+  const handoff = await readHandoff(options);
+  const ready = [], waiting = [];
+  for (const x of [...close.folders, ...close.candidates.filter((c) => c.leftover)]) {
+    if (!onScope(x.path)) continue;
+    if (x.leftover) { ready.push(x); continue; }
+    if (x.keep && !x.keep.startsWith('used ')) { kept.push(x); continue; }
+    if (x.stage === 'uncommitted') {
+      if (now - (x.touched ?? 0) < IN_USE_MS) kept.push({ ...x, keep: 'in use now, holds uncommitted work' });
+      else waiting.push(x);
+      continue;
+    }
+    // A folder an agent was asked to commit counts as ready even though that commit made it "used today".
+    if (!x.keep || handoff[x.path]) ready.push(x); else kept.push(x);
+  }
+  await pool([...ready, ...waiting].filter((x) => x.freeable === undefined), 4, async (x) => { const m = await measure(x.path); x.bytes = m.bytes; x.freeable = m.freeable; });
   const groups = new Map();
-  for (const x of close.candidates) { const key = x.project ?? basename(x.common ?? x.path); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(x); }
+  for (const x of ready) { const key = x.project ?? basename(x.common ?? x.path); if (!groups.has(key)) groups.set(key, []); groups.get(key).push(x); }
   for (const [project, list] of groups) {
-    const work = list.filter((x) => ['uncommitted', 'not pushed', 'no remote'].includes(x.stage)).length;
+    const work = list.filter((x) => ['not pushed', 'no remote'].includes(x.stage)).length;
     items.push({ key: `worktrees:${slug(project)}`, kind: 'close', selected: true, bytes: sumFree(list), close: list,
-      label: `Idle worktrees of ${project} (${list.length}): save their work${work ? ` (${work} hold unfinished work)` : ''}, then remove`,
+      label: `Idle worktrees of ${project} (${list.length}): save their work${work ? ` (${work} hold commits that exist only here)` : ''}, then remove`,
       detail: list.map((x) => `${x.path}  ${x.branch ?? '(no branch)'}  ${x.leftover ? 'already saved' : x.stage}`) });
   }
+  for (const x of waiting) {
+    const base = `work:${slug(x.project)}:${slug(folderName(x))}`;
+    let key = base, n = 2;
+    while (items.some((i) => i.key === key)) key = `${base}-${n++}`;
+    const identity = identityOf(x.path);
+    x.headAt = git(['rev-parse', '--verify', '--quiet', 'HEAD'], x.path);
+    items.push({ key, kind: 'close', notReady: true, selected: false, bytes: x.freeable ?? 0, close: [x], path: x.path, project: x.project, identity,
+      changed: x.changed, label: workLabel(x),
+      detail: [x.path, identityLine(identity), ...(x.sample ?? []).map((line) => `  ${line}`), ...(x.changed > (x.sample ?? []).length ? [`  and ${x.changed - x.sample.length} more`] : [])] });
+  }
+  // Remember which folders were handed over, so a commit made for this does not hide them as "used today".
+  const cutoff = now - HANDOFF_DAYS * DAY;
+  const next = Object.fromEntries(Object.entries(handoff).filter(([, at]) => at > cutoff));
+  for (const x of waiting) next[x.path] ??= now;
+  if (JSON.stringify(next) !== JSON.stringify(handoff)) await writeHandoff(next, options).catch(() => {});
+
   const others = scanned.filter((p) => p.kind !== 'worktrees' && p.kind !== 'report');
   for (const p of others.filter((p) => p.skipped && /running/.test(p.skipped))) notes.push(`${p.tool}: ${p.item} skipped (${p.skipped})`);
-  const ready = others.filter((p) => !p.skipped && p.removable.length && planFree(p) > 0);
+  const free = others.filter((p) => !p.skipped && p.removable.length && planFree(p) > 0);
   const byTool = new Map();
-  for (const p of ready.filter((p) => p.class !== 'history' && p.tool !== 'Package caches')) { if (!byTool.has(p.tool)) byTool.set(p.tool, []); byTool.get(p.tool).push(p); }
+  for (const p of free.filter((p) => p.class !== 'history' && p.tool !== 'Package caches')) { if (!byTool.has(p.tool)) byTool.set(p.tool, []); byTool.get(p.tool).push(p); }
   for (const [tool, plans] of byTool)
     items.push({ key: `cleanup:${slug(tool).toLowerCase()}`, kind: 'clean', selected: true, bytes: plans.reduce((s, p) => s + planFree(p), 0), plans,
       label: `${tool}: ${plans.map((p) => p.item.toLowerCase()).join(', ')} past their age limit`, detail: plans.map((p) => `${size(planFree(p)).padStart(8)}  ${p.item}`) });
-  const caches = ready.filter((p) => p.tool === 'Package caches');
+  const caches = free.filter((p) => p.tool === 'Package caches');
   if (caches.length) items.push({ key: 'caches', kind: 'clean', selected: true, bytes: caches.reduce((s, p) => s + planFree(p), 0), plans: caches,
     label: 'Package caches: they download again when needed', detail: caches.map((p) => `${size(planFree(p)).padStart(8)}  ${p.item}`) });
-  const history = ready.filter((p) => p.class === 'history');
+  const history = free.filter((p) => p.class === 'history');
   if (history.length) items.push({ key: 'history', kind: 'clean', selected: false, bytes: history.reduce((s, p) => s + planFree(p), 0), plans: history,
     label: 'Old chat history and edit history (30 days and older): deleted for good', detail: history.map((p) => `${size(planFree(p)).padStart(8)}  ${p.tool}: ${p.item}`) });
-  const junk = git(['rev-parse', '--show-toplevel'], cwd) ? await projectPlans(cwd, { ...options, now }) : [];
+  const junk = top && onScope(top) ? await projectPlans(cwd, { ...options, now }) : [];
   const trash = junk.filter((p) => p.kind === 'trash');
   if (trash.length) items.push({ key: 'leftovers', kind: 'clean', selected: true, bytes: trash.reduce((s, p) => s + p.bytes, 0), plans: trash,
     label: `Agent leftovers in this project (screenshots, temp scripts): to trash, emptied after ${TRASH_DAYS} days`, detail: trash.map((p) => `${p.files} file(s)  ${p.item}`) });
-  items.sort((a, b) => Number(b.selected) - Number(a.selected) || b.bytes - a.bytes);
-  return { items, notes, kept: close.folders.filter((x) => x.keep), at: now };
+  // Ready and suggested first, then ready and not suggested, then not ready; largest first inside each.
+  const rank = (i) => i.notReady ? 2 : i.selected ? 0 : 1;
+  items.sort((a, b) => rank(a) - rank(b) || b.bytes - a.bytes);
+  for (const i of items) i.parts = i.kind === 'close' ? i.close.map((x) => ({ path: x.path, bytes: x.freeable ?? 0 })) : i.plans.map((p) => ({ path: p.path ?? cwd, bytes: p.kind === 'trash' ? p.bytes : planFree(p) }));
+  return { items, notes, kept, at: now, scope, scopeTitle: scopeTitle(scope, top), top, cwd, drives: await listDrives(options) };
+}
+
+/**
+ * Look again at the folders that were not ready. A folder whose work is now committed becomes ready, and is
+ * checked against ground truth: the commit must exist (work that vanished without one is flagged, never called
+ * ready), and it is compared with the folder's own git identity. Returns true when anything changed.
+ */
+export async function recheckWork(plan) {
+  let changed = false;
+  for (const item of plan.items.filter((i) => i.notReady)) {
+    const x = item.close[0];
+    const raw = await gitAsync(['status', '--porcelain=v1', '-z', '--untracked-files=normal'], x.path);
+    if (raw === null) continue;
+    const left = sortStatus(raw).work.length;
+    if (left === item.changed) continue;
+    changed = true; item.changed = left; x.changed = left;
+    if (left > 0) { item.label = workLabel(x); continue; }
+    const head = (await gitAsync(['rev-parse', '--verify', '--quiet', 'HEAD'], x.path))?.trim() || null;
+    if (!head || head === x.headAt) {
+      item.warn = 'its changes are gone but nothing was committed: look at git stash and git reflog there before removing it';
+      item.label = `${folderName(x)} (${x.project}): ${item.warn}`;
+      continue;
+    }
+    const author = (await gitAsync(['log', '-1', '--format=%ae'], x.path))?.trim() || null;
+    const pushed = (await gitAsync(['rev-list', '--count', 'HEAD', '--not', '--remotes'], x.path))?.trim() === '0' && Boolean((await gitAsync(['remote'], x.path))?.trim());
+    const flags = [];
+    if (item.identity?.email && author && author !== item.identity.email) flags.push(`committed as ${author}, this folder's identity is ${item.identity.email}`);
+    if (pushed) flags.push('the commit was also pushed');
+    item.notReady = false; item.selected = true; item.committed = true; x.stage = 'committed';
+    item.warn = flags.join('; ') || null;
+    item.label = `${folderName(x)} (${x.project}): work committed${item.warn ? ` (${item.warn})` : ''}, ready: save, then remove`;
+  }
+  if (changed) { const rank = (i) => i.notReady ? 2 : i.selected ? 0 : 1; plan.items.sort((a, b) => rank(a) - rank(b) || b.bytes - a.bytes); }
+  return changed;
+}
+
+/**
+ * The task for a coding agent: the facts about each folder, and the rules. The agent brings the judgment (what
+ * the work is, how to commit it, which context matters); this tool checks the result afterwards.
+ */
+export function agentBrief(plan, { rerun, only } = {}) {
+  const waiting = only ?? plan.items.filter((i) => i.notReady);
+  const lines = [
+    'These git worktrees hold uncommitted work, so codein-tidy will not free them yet. Commit that work so nothing is lost.',
+    '',
+    'For each folder below:',
+    '1. Work inside that folder. Read the work first: git status, git diff, and every new file.',
+    '2. If it has no branch, create one: git switch -c tidy/<short-name>.',
+    '3. Commit the real work with a message that says what the work is (git add the files, then git commit).',
+    '   Commit as the git identity that folder already has (shown below). Different projects use different accounts:',
+    '   never change git config, never pass --author, never push. If a folder has no identity, leave it and say so.',
+    '4. Never run git reset, git checkout -- ., git stash or git clean, and never delete files to make a folder clean.',
+    '   If something should not be committed (secrets, huge generated files), leave that folder and say why.',
+    '5. Then record what the work was, so it can be found again. Scratch and context files are all kept, whole;',
+    '   name the ones that matter for understanding this work (or none):',
+    '   npx -y codein-tidy@latest record --project=<folder> --summary="<what this work was, in one or two sentences>" --relevant=<file,file|none|all>',
+    '',
+    'Folders:',
+  ];
+  for (const i of waiting) lines.push(`- ${i.path}`, `  ${i.close[0].branch ? `branch ${i.close[0].branch}` : 'no branch'}, ${i.changed} uncommitted file(s), ${identityLine(i.identity)}`);
+  lines.push('', rerun ? `When you are done, run: ${rerun}` : 'When you are done, say which folders you committed and on which branch.');
+  return lines.join('\n');
 }
 
 export function formatGuided(plan) {
   const total = plan.items.reduce((s, i) => s + i.bytes, 0), chosen = plan.items.filter((i) => i.selected).reduce((s, i) => s + i.bytes, 0);
-  const lines = [`codein-tidy found ${size(total)} you can get back.`, ''];
-  plan.items.forEach((item, n) => lines.push(`  [${item.selected ? 'x' : ' '}] ${String(n + 1).padStart(2)}  ${size(item.bytes).padStart(8)}  ${item.label}`));
+  const lines = [`codein-tidy found ${size(total)} you can get back ${plan.scopeTitle ?? 'on this computer'}.`];
+  const row = (item) => `  [${item.selected ? 'x' : ' '}] ${String(plan.items.indexOf(item) + 1).padStart(2)}  ${size(item.bytes).padStart(8)}  ${item.label}`;
+  const ready = plan.items.filter((i) => !i.notReady), waiting = plan.items.filter((i) => i.notReady);
+  if (ready.length) lines.push('', 'Ready to free:', ...ready.map(row));
+  if (waiting.length) lines.push('', 'Not ready yet (uncommitted work; selecting one saves a snapshot of it instead of a commit):', ...waiting.map(row));
   if (plan.kept.length) lines.push('', `Kept as they are (${plan.kept.length}): ${plan.kept.slice(0, 3).map((k) => `${k.branch ?? basename(k.path)} (${k.keep})`).join(', ')}${plan.kept.length > 3 ? ', ...' : ''}`);
   for (const note of plan.notes) lines.push(`Note: ${note}`);
   lines.push('', `Selected: ${size(chosen)}.`);
@@ -1549,6 +1813,9 @@ export async function applyItems(plan, chosen, options = {}, say = () => {}, pro
     const r = await closeFolders({ candidates: close, at: plan.at }, { ...options, onStep });
     receipt.freed += r.freed; receipt.saved += r.saved.length; receipt.bundles.push(...r.bundles); receipt.failed.push(...r.failed);
     progress?.stop({ ok: !r.failed.length, text: `Saved and removed ${r.closed.length} of ${close.length} folder(s)` });
+    const handoff = await readHandoff(options);
+    for (const x of r.closed) delete handoff[x.path];
+    await writeHandoff(handoff, options).catch(() => {});
   }
   const plans = chosen.filter((i) => i.kind === 'clean').flatMap((i) => i.plans);
   if (plans.length) {
@@ -1567,14 +1834,42 @@ export async function applyItems(plan, chosen, options = {}, say = () => {}, pro
   return receipt;
 }
 
-/** The same review for an agent: every item with its name, and how to hand the person's choice back. */
+/** What an agent sees first: the scope question, with the drives and the command for each answer. */
+export async function formatScopeQuestion(options = {}) {
+  const cwd = resolve(options.cwd ?? process.cwd()), top = git(['rev-parse', '--show-toplevel'], cwd);
+  const drives = await listDrives(options);
+  const lines = ['codein-tidy: choose the scope first. Ask the person which one they want (do not choose for them):', ''];
+  lines.push(`  --scope=computer      everything AI coding tools left on this computer${drives.length ? ` (${drives.map((d) => `${d.drive} ${size(d.free)} free`).join(', ')})` : ''}`);
+  if (drives.length > 1) lines.push(`  --scope=drive:${drives[0].drive[0]}       only the drives named, one or more: --scope=drive:${drives.slice(0, 2).map((d) => d.drive[0]).join(',')}`);
+  if (top) lines.push(`  --scope=project       only this project: ${resolve(top)} (its worktrees and agent leftovers)`);
+  lines.push('', 'Then run: npx -y codein-tidy@latest --scope=<their choice>');
+  return lines.join('\n');
+}
+
+/** The same review for an agent: every item with its name, what is not ready and why, and what to do next. */
 export function formatForAgent(plan) {
-  if (!plan.items.length) return 'codein-tidy: nothing to free; everything is in use or still recent.';
+  if (!plan.items.length) return `codein-tidy: nothing to free ${plan.scopeTitle}; everything is in use or still recent.`;
+  const flag = `--scope=${scopeFlag(plan.scope)}`;
+  const total = plan.items.reduce((s, i) => s + i.bytes, 0);
   const width = Math.max(...plan.items.map((i) => i.key.length)) + 2;
-  const lines = [formatGuided(plan).replace(/^( +\[[ x]\] +(\d+)) +/gm, (whole, lead, n) => `${lead}  ${plan.items[Number(n) - 1].key.padEnd(width)}`), ''];
-  lines.push('To the agent: show this list to the person and ask which items to free ([x] are suggested; history is deleted for good).',
-    'Then run, with their choice: npx -y codein-tidy@latest --apply=<names, comma separated> (or --apply=suggested, or --apply=all).',
-    'Never run --apply without the person\'s answer. Worktrees are saved before they are removed; codein-tidy restore <id> puts one back.');
+  const row = (item) => `  [${item.selected ? 'x' : ' '}]  ${item.key.padEnd(width)}${size(item.bytes).padStart(8)}  ${item.label}`;
+  const ready = plan.items.filter((i) => !i.notReady), waiting = plan.items.filter((i) => i.notReady);
+  const lines = [`codein-tidy found ${size(total)} you can get back ${plan.scopeTitle}.`];
+  if (ready.length) lines.push('', 'Ready to free:', ...ready.map(row));
+  if (waiting.length) lines.push('', 'Not ready yet (uncommitted work):', ...waiting.map(row));
+  if (plan.kept.length) lines.push('', `Kept as they are (${plan.kept.length}): ${plan.kept.slice(0, 5).map((k) => `${k.branch ?? basename(k.path)} (${k.keep})`).join(', ')}${plan.kept.length > 5 ? ', ...' : ''}`);
+  for (const note of plan.notes) lines.push(`Note: ${note}`);
+  lines.push('', 'To the agent:');
+  let step = 1;
+  if (waiting.length) {
+    lines.push(`${step++}. First the folders that are not ready. Tell the person they hold uncommitted work, then do this:`, '',
+      ...agentBrief(plan, { rerun: `npx -y codein-tidy@latest ${flag}  (committed folders move to "Ready to free")` }).split('\n').map((l) => `   ${l}`), '');
+  }
+  lines.push(`${step++}. Show the list to the person and ask which items to free ([x] are suggested; history is deleted for good).`,
+    `${step++}. Run their choice: npx -y codein-tidy@latest ${flag} --apply=<names, comma separated> (or --apply=suggested, or --apply=all).`,
+    '   Never run --apply without the person\'s answer.',
+    '   Before a worktree is removed, everything only it holds is saved into one file per project: its work, its commits that',
+    '   exist nowhere else, local files git ignores, and agent context and scratch files. codein-tidy restore <id> puts one back.');
   return lines.join('\n');
 }
 
@@ -1630,6 +1925,7 @@ function screen(output) {
       drawn = lines.length;
     },
     forget() { drawn = 0; },
+    clear() { if (drawn) output.write(`\x1b[${drawn}A\r\x1b[0J`); drawn = 0; },
   };
 }
 
@@ -1676,27 +1972,205 @@ function keyReader(input) {
   input.on('end', onEnd);
   input.resume();
   return {
-    next: () => queue.length ? Promise.resolve(queue.shift()) : new Promise((done) => waiting.push(done)),
+    /** The next key. With `timeout` (ms) it gives null when no key came, so the screen can refresh itself. */
+    next(timeout = 0) {
+      if (queue.length) return Promise.resolve(queue.shift());
+      return new Promise((done) => {
+        let timer = null;
+        const waiter = (k) => { if (timer) clearTimeout(timer); done(k); };
+        waiting.push(waiter);
+        if (timeout) timer = setTimeout(() => { const at = waiting.indexOf(waiter); if (at >= 0) waiting.splice(at, 1); done(null); }, timeout);
+      });
+    },
     close() { input.off('keypress', onKey); input.off('end', onEnd); try { input.setRawMode(false); } catch {} input.pause(); },
   };
 }
 let readlineModule;
 
 const isQuit = ({ key }) => key.name === 'eof' || key.name === 'escape' || key.name === 'q' || (key.ctrl && key.name === 'c');
+const isUp = ({ key }) => key.name === 'up' || key.name === 'k';
+const isDown = ({ key }) => key.name === 'down' || key.name === 'j' || key.name === 'tab';
+const isEnter = ({ key }) => key.name === 'return' || key.name === 'enter';
+const keyHelp = (c, pairs) => `  ${pairs.map(([k, what]) => `${c.bold(k)} ${what}`).join('   ')}`;
+
+/** One choice from a short list, by arrow keys. Returns the choice's value, or 'quit'. */
+async function chooseOne(ui, head, choices, { back = false } = {}) {
+  const { c, scr, keys } = ui;
+  let at = 0;
+  for (;;) {
+    const lines = [...head, ''];
+    choices.forEach((o, n) => lines.push(`${n === at ? c.cyan(' > ') : '   '}${n === at ? c.bold(o.label) : o.label}${o.about ? `  ${c.dim(o.about)}` : ''}`));
+    lines.push('', keyHelp(c, [['Up/Down', 'move'], ['Enter', 'choose'], ...(back ? [['Left', 'back']] : []), ['Q', 'quit']]));
+    scr.draw(lines);
+    const press = await keys.next();
+    if (isQuit(press)) return 'quit';
+    if (back && (press.key.name === 'left' || press.key.name === 'backspace')) return 'back';
+    if (isUp(press)) at = (at + choices.length - 1) % choices.length;
+    else if (isDown(press)) at = (at + 1) % choices.length;
+    else if (isEnter(press)) return choices[at].value;
+  }
+}
+
+/** Where to look: this computer, some drives, or only this project. Asked first, before anything is measured. */
+async function pickScope(ui, options) {
+  const { c, scr, keys } = ui;
+  const top = git(['rev-parse', '--show-toplevel'], resolve(options.cwd ?? process.cwd()));
+  const drives = await listDrives(options);
+  const choices = [{ value: 'computer', label: 'This computer', about: `everything AI coding tools left${drives.length ? ` (${drives.map((d) => `${d.drive} ${size(d.free)} free`).join(', ')})` : ''}` }];
+  if (drives.length > 1) choices.push({ value: 'drives', label: 'Choose drives', about: 'only the drives you tick' });
+  if (top) choices.push({ value: 'project', label: 'This project only', about: resolve(top) });
+  if (choices.length === 1) return { kind: 'computer' };
+  for (;;) {
+    const choice = await chooseOne(ui, [`  ${c.bold('Where should it look?')}`], choices);
+    if (choice !== 'drives') return choice === 'quit' ? 'quit' : { kind: choice };
+    const ticked = new Set();
+    let at = 0, message = '';
+    for (;;) {
+      const lines = [`  ${c.bold('Which drives?')}`, ''];
+      drives.forEach((d, n) => lines.push(`${n === at ? c.cyan(' > ') : '   '}${ticked.has(d.drive) ? c.green('[x]') : c.dim('[ ]')} ${n === at ? c.bold(d.drive) : d.drive}  ${c.dim(`${size(d.free)} free of ${size(d.total)}`)}`));
+      lines.push('', message ? `  ${c.yellow(message)}` : keyHelp(c, [['Up/Down', 'move'], ['Space', 'select'], ['A', 'all'], ['Enter', 'continue'], ['Left', 'back'], ['Q', 'quit']]));
+      scr.draw(lines);
+      message = '';
+      const press = await keys.next();
+      if (isQuit(press)) return 'quit';
+      if (press.key.name === 'left' || press.key.name === 'backspace') break;
+      if (isUp(press)) at = (at + drives.length - 1) % drives.length;
+      else if (isDown(press)) at = (at + 1) % drives.length;
+      else if (press.key.name === 'space' || press.key.name === 'x') { const d = drives[at].drive; if (ticked.has(d)) ticked.delete(d); else ticked.add(d); }
+      else if (press.key.name === 'a') { if (ticked.size === drives.length) ticked.clear(); else drives.forEach((d) => ticked.add(d.drive)); }
+      else if (isEnter(press)) {
+        if (ticked.size) return { kind: 'drives', drives: drives.map((d) => d.drive).filter((d) => ticked.has(d)) };
+        message = 'No drive is selected. Press Space on a drive.';
+      }
+    }
+  }
+}
+
+// Coding agents that can take a task from the command line. The task goes in on stdin where the tool reads it,
+// otherwise as one short sentence pointing at the task file. CODEIN_TIDY_AGENT="<command>" adds your own.
+const AGENT_CLIS = [
+  { name: 'Claude Code', bin: 'claude', stdin: true, args: () => ['-p', '--permission-mode', 'acceptEdits', '--allowedTools', 'Bash(git:*)', 'Bash(npx:*)', 'Read', 'Grep', 'Glob'] },
+  { name: 'Codex', bin: 'codex', args: (message) => ['exec', '--full-auto', message] },
+  { name: 'code.in', bin: 'codein', args: (message) => ['--print', message] },
+  // OpenCode counts a linked worktree and the task file as outside its project and refuses both when it runs
+  // unattended: the task is attached with --file, and that one permission is allowed for this run only.
+  { name: 'OpenCode', bin: 'opencode', env: { OPENCODE_CONFIG_CONTENT: JSON.stringify({ permission: { external_directory: 'allow' } }) },
+    args: (message, file) => ['run', 'Do exactly what the attached task file says.', '--file', file] },
+];
+
+export function detectAgents(options = {}) {
+  if (options.agents) return options.agents;
+  const found = AGENT_CLIS.filter((a) => { try { execFileSync(platform() === 'win32' ? 'where' : 'which', [a.bin], { stdio: 'ignore' }); return true; } catch { return false; } });
+  const own = (options.env ?? process.env).CODEIN_TIDY_AGENT?.trim();
+  if (own) { const [bin, ...rest] = own.split(/\s+/); found.unshift({ name: `Your agent (${bin})`, bin, args: (message) => [...rest, message] }); }
+  return found;
+}
+
+/** Run an agent on one folder and wait. Its output is captured: `onLine` gets each line as it comes. */
+export function runAgent(agent, cwd, brief, file, onLine) {
+  return new Promise((done) => {
+    const args = agent.args(`Read the file ${file} and do exactly what it says.`, file);
+    const quote = (a) => /[\s()&|<>^]/.test(a) ? `"${a}"` : a;
+    const env = { ...process.env, ...(agent.env ?? {}) };
+    let child;
+    try {
+      child = platform() === 'win32' && !agent.direct
+        ? spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `"${[agent.bin, ...args.map(quote)].join(' ')}"`], { cwd, env, windowsVerbatimArguments: true })
+        : spawn(agent.bin, args, { cwd, env });
+    } catch (error) { done({ code: -1, out: String(error.message ?? error) }); return; }
+    let out = '';
+    const take = (data) => { out = (out + data).slice(-8000); const last = String(data).trim().split(/\r?\n/).pop()?.trim(); if (last) onLine?.(last); };
+    child.stdout.on('data', take);
+    child.stderr.on('data', take);
+    child.on('error', (error) => done({ code: -1, out: String(error.message ?? error) }));
+    child.on('exit', (code) => done({ code: code ?? -1, out }));
+    child.stdin.on('error', () => {});
+    child.stdin.end(agent.stdin ? brief : '');
+  });
+}
+
+function copyToClipboard(text) {
+  const tools = platform() === 'win32' ? [['clip', []]] : platform() === 'darwin' ? [['pbcopy', []]] : [['wl-copy', []], ['xclip', ['-selection', 'clipboard']]];
+  for (const [command, args] of tools) { try { execFileSync(command, args, { input: text, stdio: ['pipe', 'ignore', 'ignore'] }); return true; } catch {} }
+  return false;
+}
+
+/**
+ * The folders that are not ready, and who commits their work: an agent installed here (run from this screen,
+ * one folder at a time, each checked afterwards), the person's own agent (the task is copied for it), or
+ * nobody for now. Returns 'list' or 'quit'.
+ */
+async function workScreen(plan, ui, options) {
+  const { c, scr, say, progress } = ui;
+  const waiting = plan.items.filter((i) => i.notReady);
+  if (!waiting.length) return 'list';
+  const head = [`  ${c.bold(`${waiting.length} worktree(s) are not ready`)}: they hold uncommitted work.`, ''];
+  for (const i of waiting.slice(0, 8)) head.push(`     ${`${i.changed} file(s)`.padStart(12)}  ${size(i.bytes).padStart(8)}  ${folderName(i.close[0])} ${c.dim(`(${i.project})  ${identityLine(i.identity)}`)}`);
+  if (waiting.length > 8) head.push(c.dim(`     and ${waiting.length - 8} more`));
+  head.push('', c.dim('  A coding agent should read that work and commit it, as the git account each folder already uses.'),
+    c.dim('  Nothing is pushed. Each folder is checked afterwards, and this list updates.'));
+  const agents = detectAgents(options);
+  const choice = await chooseOne(ui, head, [
+    ...agents.map((a) => ({ value: a, label: `Hand them to ${a.name} now` })),
+    { value: 'copy', label: 'Copy the task for my own agent' },
+    { value: 'skip', label: 'Skip for now', about: 'they stay; selecting one later saves a snapshot instead of a commit' },
+  ]);
+  if (choice === 'quit') return 'quit';
+  if (choice === 'skip') return 'list';
+  const file = join(tidyHome(options), 'agent-task.md');
+  await fs.mkdir(tidyHome(options), { recursive: true });
+  if (choice === 'copy') {
+    const task = agentBrief(plan);
+    await fs.writeFile(file, task);
+    plan.message = `The task is ${(options.copy ?? copyToClipboard)(task) ? 'on the clipboard and ' : ''}saved in ${file}. Give it to your agent; this list updates as it commits.`;
+    return 'list';
+  }
+  // Run the chosen agent, one folder at a time, in that folder. It has its own pipes, so this screen keeps the keyboard.
+  scr.clear();
+  let done = 0;
+  for (const item of waiting) {
+    const name = folderName(item.close[0]);
+    const task = agentBrief(plan, { only: [item] });
+    await fs.writeFile(file, task);
+    progress.set({ label: `${choice.name} is committing ${name}`, done, total: waiting.length, note: '' });
+    const result = await runAgent(choice, item.path, task, file, (line) => progress.set({ note: line }));
+    await recheckWork(plan);
+    done += 1;
+    progress.stop({ ok: !item.notReady && !item.warn, text: item.notReady
+      ? `${name}: ${item.warn ?? `still holds ${item.changed} uncommitted file(s)`}${result.code ? ` (${choice.name} ended with code ${result.code})` : ''}`
+      : `${name}: committed${item.warn ? `, but ${item.warn}` : ''}` });
+    if (item.notReady) for (const line of result.out.trim().split(/\r?\n/).slice(-4)) say(c.dim(`      ${line}`));
+  }
+  say('');
+  ui.output.write('\x1b[?25l');
+  return 'list';
+}
+
+const driveLine = (plan) => {
+  if (!plan.drives?.length) return null;
+  const add = new Map();
+  for (const item of plan.items.filter((i) => i.selected)) for (const part of item.parts ?? []) add.set(driveOf(part.path), (add.get(driveOf(part.path)) ?? 0) + part.bytes);
+  const rows = plan.drives.filter((d) => add.get(d.drive)).map((d) => `${d.drive} ${size(d.free)} free, about ${size(add.get(d.drive))} more`);
+  return rows.length ? `  After this: ${rows.join('   ')}` : null;
+};
 
 function itemLines(plan, at, open, c, scr, message) {
   const total = plan.items.reduce((s, i) => s + i.bytes, 0), chosen = plan.items.filter((i) => i.selected).reduce((s, i) => s + i.bytes, 0);
   const largest = Math.max(1, ...plan.items.map((i) => i.bytes));
-  const lines = [`  ${c.bold(size(total))} can be freed. Choose what to free.`, ''];
+  const waiting = plan.items.filter((i) => i.notReady).length;
+  const lines = [`  ${c.bold(size(total))} can be freed ${plan.scopeTitle}. Choose what to free.`];
+  let section = '';
   plan.items.forEach((item, n) => {
+    const now = item.notReady ? 'Not ready yet: uncommitted work' : 'Ready to free';
+    if (now !== section) { section = now; lines.push('', `  ${item.notReady ? c.yellow(now) : c.bold(now)}`); }
     const here = n === at;
     const box = item.selected ? c.green('[x]') : c.dim('[ ]');
     const split = item.label.indexOf(': ');
     const title = split > 0 ? item.label.slice(0, split) : item.label, about = split > 0 ? item.label.slice(split + 2) : '';
-    const what = item.key === 'history' ? c.yellow(about) : c.dim(about);
+    const what = item.key === 'history' || item.notReady || item.warn ? c.yellow(about) : item.committed ? c.green(about) : c.dim(about);
     lines.push(`${here ? c.cyan(' > ') : '   '}${box} ${size(item.bytes).padStart(8)}  ${c.dim(meter(item.bytes, largest, 10))}  ${here ? c.bold(title) : title}  ${what}`);
     if (n === open) {
-      const room = Math.max(3, scr.rows() - plan.items.length - 12);
+      const room = Math.max(3, scr.rows() - plan.items.length - 16);
       for (const d of item.detail.slice(0, room)) lines.push(`        ${c.dim(d)}`);
       if (item.detail.length > room) lines.push(`        ${c.dim(`and ${item.detail.length - room} more`)}`);
     }
@@ -1704,63 +2178,75 @@ function itemLines(plan, at, open, c, scr, message) {
   lines.push('');
   if (plan.kept.length) lines.push(c.dim(`  Kept as they are (${plan.kept.length}): ${plan.kept.slice(0, 3).map((k) => `${k.branch ?? basename(k.path)} (${k.keep})`).join(', ')}${plan.kept.length > 3 ? ', ...' : ''}`));
   for (const note of plan.notes) lines.push(c.dim(`  ${note}`));
-  lines.push(`  Selected: ${c.bold(size(chosen))} of ${size(total)}`, '');
-  lines.push(message ? `  ${c.yellow(message)}` : `  ${c.bold('Up/Down')} move   ${c.bold('Space')} select   ${c.bold('A')} all   ${c.bold('Right')} details   ${c.bold('Enter')} continue   ${c.bold('Q')} quit`);
+  lines.push(`  Selected: ${c.bold(size(chosen))} of ${size(total)}`);
+  const drives = driveLine(plan);
+  if (drives) lines.push(c.dim(drives));
+  lines.push('');
+  if (plan.message) lines.push(`  ${c.green(plan.message)}`, '');
+  lines.push(message ? `  ${c.yellow(message)}` : keyHelp(c, [['Up/Down', 'move'], ['Space', 'select'], ['A', 'all'], ['Right', 'details'], ...(waiting ? [['P', 'hand to an agent']] : []), ['Enter', 'continue'], ['Q', 'quit']]));
   return lines;
 }
 
-/** The list: arrow keys move, space selects, Enter continues. Returns 'go' or 'quit'. */
-async function pickItems(plan, keys, scr, c) {
-  let at = 0, open = -1, message = '';
+/** The list: arrow keys move, space selects, Enter continues. While folders are not ready it looks at them
+ * again every few seconds, so a commit made by an agent shows up by itself. Returns 'go', 'agent' or 'quit'. */
+async function pickItems(plan, ui) {
+  const { c, scr } = ui;
+  let at = 0, open = -1, message = '', draw = true;
   for (;;) {
-    scr.draw(itemLines(plan, at, open, c, scr, message));
-    message = '';
-    const press = await keys.next(), { key, str } = press, n = plan.items.length;
+    if (draw) scr.draw(itemLines(plan, at, open, c, scr, message));
+    draw = true; message = '';
+    const waiting = plan.items.some((i) => i.notReady);
+    const press = await ui.keys.next(waiting ? 3000 : 0);
+    if (!press) {
+      const current = plan.items[at], opened = plan.items[open];
+      draw = await recheckWork(plan);
+      if (draw) { at = Math.max(0, plan.items.indexOf(current)); open = opened ? plan.items.indexOf(opened) : -1; }
+      continue;
+    }
+    const { key, str } = press, n = plan.items.length;
     if (isQuit(press)) return 'quit';
-    if (key.name === 'up' || key.name === 'k') at = (at + n - 1) % n;
-    else if (key.name === 'down' || key.name === 'j' || key.name === 'tab') at = (at + 1) % n;
+    if (isUp(press)) at = (at + n - 1) % n;
+    else if (isDown(press)) at = (at + 1) % n;
     else if (key.name === 'space' || key.name === 'x') plan.items[at].selected = !plan.items[at].selected;
     else if (key.name === 'a') { const all = plan.items.every((i) => i.selected); plan.items.forEach((i) => { i.selected = !all; }); }
     else if (key.name === 'n') plan.items.forEach((i) => { i.selected = false; });
     else if (key.name === 'right' || key.name === 'l' || key.name === 'd') open = open === at ? -1 : at;
     else if (key.name === 'left' || key.name === 'h') open = -1;
+    else if (key.name === 'p' && waiting) return 'agent';
     else if (/^[1-9]$/.test(str) && Number(str) <= n) { at = Number(str) - 1; plan.items[at].selected = !plan.items[at].selected; }
-    else if (key.name === 'return' || key.name === 'enter') {
+    else if (isEnter(press)) {
       if (plan.items.some((i) => i.selected)) return 'go';
       message = 'Nothing is selected. Press Space on an item, or A for all.';
     }
   }
 }
 
-/** Yes / back / quit, by arrow keys (or y, n, q). */
-async function confirmChoice(plan, chosen, keys, scr, c) {
-  const folders = chosen.filter((i) => i.kind === 'close').reduce((n, i) => n + i.close.length, 0);
+/** Yes / back / quit, by arrow keys (or y, n, q). Says what is saved where before anything is removed. */
+async function confirmChoice(plan, chosen, ui, options) {
+  const { c } = ui;
+  const closing = chosen.filter((i) => i.kind === 'close');
+  const folders = closing.reduce((n, i) => n + i.close.length, 0);
+  const snapshots = closing.filter((i) => i.notReady).length;
   const freed = size(chosen.reduce((s, i) => s + i.bytes, 0));
-  const options = [
+  const head = [`  ${c.bold('Ready.')}`];
+  if (folders) {
+    head.push(c.dim(`  First, everything only these ${folders} folder(s) hold is saved: work, commits that exist nowhere else,`),
+      c.dim('  local files git ignores, agent context and scratch. One file per project:'));
+    for (const project of new Set(closing.flatMap((i) => i.close.map((x) => x.project)))) head.push(`    ${join(tidyHome(options), 'saved', `${slug(project)}-${stampOf(plan.at)}.bundle`)}`);
+    head.push(c.dim('  codein-tidy restore <id> puts a folder back exactly.'));
+  }
+  if (snapshots) head.push(`  ${c.yellow(`${snapshots} folder(s) still hold uncommitted work: it is saved as a snapshot, not as a commit in your name.`)}`);
+  if (chosen.some((i) => i.key === 'history')) head.push(`  ${c.yellow('Old chat history will be deleted for good.')}`);
+  const answer = await chooseOne(ui, head, [
     { value: 'yes', label: folders ? `Yes: save the work of ${folders} folder(s), then free about ${freed}` : `Yes: free about ${freed}` },
     { value: 'back', label: 'No: back to the list' },
     { value: 'quit', label: 'Quit without changing anything' },
-  ];
-  let at = 0;
-  for (;;) {
-    const lines = [`  ${c.bold('Ready.')}`];
-    if (folders) lines.push(c.dim(`  Each folder's work is saved into one file per project first. codein-tidy restore <id> puts one back.`));
-    if (chosen.some((i) => i.key === 'history')) lines.push(`  ${c.yellow('Old chat history will be deleted for good.')}`);
-    lines.push('');
-    options.forEach((o, n) => lines.push(`${n === at ? c.cyan(' > ') : '   '}${n === at ? c.bold(o.label) : o.label}`));
-    lines.push('', `  ${c.bold('Up/Down')} move   ${c.bold('Enter')} choose`);
-    scr.draw(lines);
-    const press = await keys.next(), { key } = press;
-    if (isQuit(press)) return 'quit';
-    if (key.name === 'y') return 'yes';
-    if (key.name === 'n' || key.name === 'left' || key.name === 'backspace') return 'back';
-    if (key.name === 'up' || key.name === 'k') at = (at + options.length - 1) % options.length;
-    else if (key.name === 'down' || key.name === 'j' || key.name === 'tab') at = (at + 1) % options.length;
-    else if (key.name === 'return' || key.name === 'enter') return options[at].value;
-  }
+  ], { back: true });
+  return answer;
 }
 
-/** The whole job in a terminal: scan with a live bar, pick with the arrow keys, confirm, then do it with a live bar. */
+/** The whole job in a terminal: where to look, a scan with a live bar, what is ready and what is not (with a
+ * hand-off to a coding agent), the list, one confirmation, then the work with a live bar. */
 async function guidedTui({ input, output, options }) {
   readlineModule ??= await import('node:readline');
   const c = paint(output), scr = screen(output), progress = progressLine(output);
@@ -1768,23 +2254,32 @@ async function guidedTui({ input, output, options }) {
   say('');
   say(`  ${c.bold('codein-tidy')}  ${c.dim('frees what AI coding tools leave behind')}`);
   say('');
-  progress.set({ label: 'Looking at what AI coding tools left', done: 0, total: 0, note: '' });
-  let plan;
-  try { plan = await guidedPlan({ ...options, onStatus: (s) => progress.set({ note: '', ...s }) }); }
-  finally { progress.stop(); }
-  if (!plan.items.length) { say(`  ${c.green('✓')} Nothing to free: everything is in use or still recent.`); return { done: false }; }
-  const keys = keyReader(input);
-  let chosen;
+  const ui = { c, scr, say, progress, input, output, keys: keyReader(input) };
+  const stopped = () => { scr.forget(); say(''); say('  Nothing was changed.'); return { done: false }; };
+  let plan, chosen;
   output.write('\x1b[?25l');
   try {
+    const scope = options.scope ?? await pickScope(ui, options);
+    if (scope === 'quit') return stopped();
+    scr.clear();
+    progress.set({ label: 'Looking at what AI coding tools left', done: 0, total: 0, note: '' });
+    try { plan = await guidedPlan({ ...options, scope, onStatus: (s) => progress.set({ note: '', ...s }) }); }
+    finally { progress.stop(); }
+    if (!plan.items.length) { say(`  ${c.green('✓')} Nothing to free ${plan.scopeTitle}: everything is in use or still recent.`); return { done: false }; }
+    output.write('\x1b[?25l');
+    let offer = plan.items.some((i) => i.notReady);
     for (;;) {
-      if (await pickItems(plan, keys, scr, c) === 'quit') { say(''); say('  Nothing was changed.'); return { done: false }; }
+      if (offer) { offer = false; if (await workScreen(plan, ui, options) === 'quit') return stopped(); }
+      const pick = await pickItems(plan, ui);
+      plan.message = '';
+      if (pick === 'quit') return stopped();
+      if (pick === 'agent') { offer = true; continue; }
       chosen = plan.items.filter((i) => i.selected);
-      const answer = await confirmChoice(plan, chosen, keys, scr, c);
-      if (answer === 'quit') { say(''); say('  Nothing was changed.'); return { done: false }; }
+      const answer = await confirmChoice(plan, chosen, ui, options);
+      if (answer === 'quit') return stopped();
       if (answer === 'yes') break;
     }
-  } finally { keys.close(); output.write('\x1b[?25h'); }
+  } finally { ui.keys.close(); output.write('\x1b[?25h'); }
   scr.forget();
   say('');
   const receipt = await applyItems(plan, chosen, options, (line) => say(line.startsWith('Done.') ? `  ${c.green(c.bold(line))}` : line ? `  ${line}` : ''), progress);
@@ -1860,15 +2355,21 @@ export async function main(argv) {
   // The bare command does the whole job. A person in a terminal reviews and confirms once. An agent gets the same
   // review as text (or --json) to show the person, then hands their choice back with --apply.
   const apply = value('apply');
+  const scopeText = value('scope'), scope = scopeText === undefined ? undefined : parseScope(scopeText);
+  if (scopeText !== undefined && !scope) { console.error('--scope must be computer, project or drive:<letters> (for example --scope=drive:C,D)'); process.exitCode = 2; return; }
   if (!positional.length && !args.has('--report')) {
     if (apply === undefined && !args.has('--json') && process.stdin.isTTY && process.stdout.isTTY) {
-      await guidedRun({ options });
+      await guidedRun({ options: { ...options, ...(scope ? { scope } : {}) } });
       console.log('\nKeep your disk free automatically: code.in cleans up after itself. https://code.in');
       return;
     }
-    const plan = await guidedPlan(options);
+    // An agent is asked for the scope first too: it prints the choices and the command for each.
+    if (!scope && apply === undefined && !args.has('--json')) { console.log(await formatScopeQuestion(options)); return; }
+    let plan;
+    try { plan = await guidedPlan({ ...options, scope: scope ?? { kind: 'computer' } }); }
+    catch (error) { console.error(String(error.message ?? error)); process.exitCode = 1; return; }
     if (apply === undefined) {
-      console.log(args.has('--json') ? JSON.stringify(plan.items.map(({ key, label, bytes, selected, detail }) => ({ key, label, bytes, suggested: selected, detail })), null, 2) : formatForAgent(plan));
+      console.log(args.has('--json') ? JSON.stringify(plan.items.map(({ key, label, bytes, selected, detail, notReady, path, identity }) => ({ key, label, bytes, suggested: selected, ready: !notReady, ...(notReady ? { path, identity } : {}), detail })), null, 2) : formatForAgent(plan));
       return;
     }
     const names = apply.split(',').map((n) => n.trim()).filter(Boolean);
@@ -1880,7 +2381,7 @@ export async function main(argv) {
     if (args.has('--json')) console.log(JSON.stringify(receipt));
     return;
   }
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps', 'guard'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps', 'guard', 'record'];
   if (command === 'guard') {
     const mode = value('mode') ?? 'notify';
     if (!['notify', 'close'].includes(mode)) { console.error('--mode must be notify or close'); process.exitCode = 2; return; }
@@ -1895,6 +2396,16 @@ export async function main(argv) {
       for (const p of r.projects) console.log(`${p.name}: ${p.linked} worktree(s), budget ${p.budget}${p.over ? `, ${p.over} over` : ', within budget'}${p.closed ? `; closed ${p.closed} (work saved from ${p.saved})` : ''}${p.failed.length ? `; could not close ${p.failed.length}` : ''}.`);
       if (!r.projects.length) console.log('No known projects yet. Register one: codein-tidy guard --install --project=PATH');
     }
+    return;
+  }
+  if (command === 'record') {
+    // An agent's review of a folder: what the work was and which context matters. Stored with the work at save.
+    const relevant = value('relevant');
+    try {
+      const r = await recordReview(options.project ?? process.cwd(), { summary: value('summary'),
+        relevant: relevant === undefined || relevant === 'all' ? 'all' : relevant === 'none' ? 'none' : relevant.split(',') });
+      console.log(`Recorded for ${r.path}: ${Array.isArray(r.relevant) ? `${r.relevant.length} file(s) marked relevant` : 'all context marked relevant'}. Every file is still kept whole when the folder is saved.`);
+    } catch (error) { console.error(String(error.message ?? error)); process.exitCode = 1; }
     return;
   }
   if (command === 'deps') {

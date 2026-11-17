@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer, parseScope, recheckWork, formatForAgent, recordReview } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -562,7 +562,11 @@ test('save then restore gives back the exact folder: changes, deletions, new fil
   const saved = await saveFolder(tree, { home: m.home });
   assert.equal(saved.saved, true);
   assert.ok(saved.bundle && await exists(saved.bundle));
-  assert.equal(saved.kept.files, 1);
+  // One file holds it all: the local file git ignores and the agent's context, each labelled by what it is.
+  assert.deepEqual(saved.extras.files.map((f) => [f.rel, f.role]).sort(), [['.code-in/state/x.json', 'context'], ['.env.local', 'local']]);
+  assert.deepEqual([saved.parts.work > 0, saved.parts.local, saved.parts.context, saved.reviewed], [true, 1, 1, false]);
+  assert.equal(g(['bundle', 'list-heads', saved.bundle], repo).split('\n').length, 2, 'the work snapshot and the extras, in one bundle');
+  assert.equal(await exists(join(m.home, '.codein-tidy', 'kept')), false, 'no loose copies beside the bundle');
   assert.equal((await savedList({ home: m.home })).length, 1);
   assert.match(g(['log', '-1', '--format=%an %s', saved.ref], repo), /^codein-tidy codein-tidy snapshot of/);
   assert.equal(g(['status', '--porcelain'], tree).includes('new.js'), true, 'the folder itself is untouched');
@@ -576,6 +580,7 @@ test('save then restore gives back the exact folder: changes, deletions, new fil
   assert.equal(await exists(join(tree, 'b.txt')), false);
   assert.equal(await readFile(join(tree, 'new.js'), 'utf8'), 'new');
   assert.equal(await readFile(join(tree, '.env.local'), 'utf8'), 'SECRET=only-here');
+  assert.equal(await exists(join(tree, '.code-in', 'state', 'x.json')), true, 'agent context comes back too');
   assert.equal(await readFile(join(tree, 'local.txt'), 'utf8'), 'commit on no branch');
   assert.ok(g(['status', '--porcelain'], tree).includes('M a.txt'), 'the changes are uncommitted again, as they were');
 });
@@ -630,17 +635,20 @@ test('close: idle worktrees are saved into one file and freed; recent, locked an
   assert.equal(await exists(join(repo, 'a.txt')), true, 'the main checkout is never touched');
   assert.equal(receipt.saved.length, 2, 'dirty (its work) and env (its local file); done had nothing to save');
   assert.equal(receipt.bundles.length, 1, 'one file for the project');
-  // The bundle holds the commits no remote has: the dirty folder's snapshot. The env folder's commit is on the
-  // remote already; its local file is in the keep folder.
-  const heads = g(['bundle', 'list-heads', receipt.bundles[0]], repo).split('\n');
-  assert.equal(heads.length, 1);
-  assert.equal(heads[0].split(' ')[0], receipt.saved.find((r) => r.path === wt('dirty')).snapshot);
+  // The one bundle holds what no remote has: the dirty folder's work snapshot, its scratch file, and the env
+  // folder's local file. (The env folder's own commit is on the remote already.)
+  const heads = g(['bundle', 'list-heads', receipt.bundles[0]], repo).split('\n').map((l) => l.split(' ')[0]);
+  const dirty = receipt.saved.find((r) => r.path === wt('dirty')), envSaved = receipt.saved.find((r) => r.path === wt('env'));
+  assert.deepEqual(heads.sort(), [dirty.snapshot, dirty.extras.commit, envSaved.extras.commit].sort());
+  assert.deepEqual(dirty.extras.files.map((f) => [f.rel, f.role]), [['.tmp-probe.py', 'scratch']]);
+  assert.equal(g(['ls-tree', '-r', '--name-only', dirty.snapshot], repo).includes('.tmp-probe'), false, 'the work snapshot holds work only');
 
   const saved = await savedList({ home: m.home });
   const back = await restoreSaved(saved.find((r) => r.path === wt('dirty')).id, { home: m.home });
   assert.deepEqual([back.restored, back.branch], [true, 'dirty']);
   const { readFile } = await import('node:fs/promises');
   assert.equal(await readFile(join(wt('dirty'), 'work.js'), 'utf8'), 'unfinished');
+  assert.equal(await exists(join(wt('dirty'), '.tmp-probe.py')), true, 'the scratch file came back from the same bundle');
   const env = await restoreSaved(saved.find((r) => r.path === wt('env')).id, { home: m.home });
   assert.equal(env.restored, true);
   assert.equal(await readFile(join(wt('env'), '.env.local'), 'utf8'), 'KEY=1');
@@ -658,8 +666,11 @@ test('clean --worktrees keeps a copy of ignored local files before git deletes t
   assert.deepEqual(receipt.failed, []);
   assert.equal(await exists(tree), false);
   const [record] = await savedList({ home: m.home });
+  assert.deepEqual(record.extras.files.map((f) => [f.rel, f.role]), [['.env.local', 'local']]);
+  const back = await restoreSaved(record.id, { home: m.home });
+  assert.equal(back.restored, true);
   const { readFile } = await import('node:fs/promises');
-  assert.equal(await readFile(join(record.kept.dir, '.env.local'), 'utf8'), 'TOKEN=only-copy');
+  assert.equal(await readFile(join(tree, '.env.local'), 'utf8'), 'TOKEN=only-copy');
 });
 
 test('slots: a budget of working folders, reused across tasks; work left in a slot is saved before reuse', async () => {
@@ -888,17 +899,18 @@ test('guided: one command scans, shows a review list, takes a selection and one 
     return { result: await done, text };
   };
 
-  // Quit changes nothing; the list shows each item with its size, history is not preselected.
+  // Quit changes nothing; the list shows each item with its size, history is not preselected, and a folder
+  // holding uncommitted work is "not ready": listed apart and never preselected.
   const quit = await run(['q']);
   assert.equal(quit.result.done, false);
-  assert.match(quit.text, /\[x\] +\d+ +.*Idle worktrees of app \(1\): save their work \(1 hold unfinished work\), then remove/);
+  assert.match(quit.text, /Not ready yet \(uncommitted work.*\):\n +\[ \] +\d+ +.*idle \(app\): 1 uncommitted file\(s\)/);
   assert.match(quit.text, /\[ \] +\d+ +.*Old chat history/);
   assert.match(quit.text, /\[x\] +\d+ +.*Agent leftovers in this project/);
   assert.equal(await exists(idle), true);
 
-  // Details, then go with the suggestion, then yes. (Items are sorted by size: find the worktrees' number.)
-  const n = /\[x\] +(\d+) +\S+ \S+ +Idle worktrees/.exec(quit.text)[1];
-  const go = await run([`d ${n}`, '', 'y']);
+  // Details, then select the folder anyway (its work is then saved as a snapshot), go on, yes.
+  const n = /\[ \] +(\d+) +\S+ \S+ +idle \(app\)/.exec(quit.text)[1];
+  const go = await run([`d ${n}`, n, '', 'y']);
   assert.equal(go.result.done, true, go.text);
   assert.ok(go.text.includes(idle), 'the details list the folder');
   assert.equal(await exists(idle), false, 'the idle worktree is gone');
@@ -970,7 +982,7 @@ test('guided in a terminal: arrow keys and space pick, Enter confirms, live prog
     input.isTTY = true; input.setRawMode = () => input;
     output.isTTY = true; output.columns = 140; output.rows = 40;
     output.on('data', (d) => { text += d; });
-    const done = guidedRun({ input, output, options: { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY } });
+    const done = guidedRun({ input, output, options: { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY, scope: { kind: 'computer' } } });
     for (const k of keys) input.write(k);
     input.end();
     const result = await done;
@@ -1009,6 +1021,174 @@ test('guided in a terminal: arrow keys and space pick, Enter confirms, live prog
   assert.equal(await exists(chat), false);
 });
 
+test('scope: asked first; computer, chosen drives or this project only', async () => {
+  assert.deepEqual(parseScope('computer'), { kind: 'computer' });
+  assert.deepEqual(parseScope('project'), { kind: 'project' });
+  assert.deepEqual(parseScope('drive:c,D'), { kind: 'drives', drives: ['C:', 'D:'] });
+  assert.deepEqual(parseScope('drives=d'), { kind: 'drives', drives: ['D:'] });
+  assert.equal(parseScope('everything-ish'), null);
+
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const done = join(m.root, 'wt', 'done');
+  g(['worktree', 'add', '-q', '--detach', done, 'main'], repo);
+  await aged(join(m.home, '.claude', 'shell-snapshots', 'old.sh'), 10);
+  await aged(join(repo, '.tmp-probe.py'), 10);
+  const base = { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY };
+  const keys = async (scope) => (await guidedPlan({ ...base, scope })).items.map((i) => i.key).sort();
+
+  assert.deepEqual(await keys({ kind: 'computer' }), ['cleanup:claude-code', 'leftovers', 'worktrees:app']);
+  // This project only: its worktrees and leftovers, none of the tools' own data.
+  assert.deepEqual(await keys({ kind: 'project' }), ['leftovers', 'worktrees:app']);
+  // Drives: only what sits on the named drives.
+  const here = /^([A-Za-z]:)/.exec(m.root)?.[1].toUpperCase() ?? '/';
+  assert.deepEqual(await keys({ kind: 'drives', drives: [here] }), ['cleanup:claude-code', 'leftovers', 'worktrees:app']);
+  assert.deepEqual(await keys({ kind: 'drives', drives: ['Q:'] }), []);
+  await assert.rejects(guidedPlan({ ...base, cwd: m.root, scope: { kind: 'project' } }), /not inside a git project/);
+
+  // In a terminal the first screen is the scope; drives can be ticked, one or several.
+  const { PassThrough } = await import('node:stream');
+  const run = async (pressed) => {
+    const input = new PassThrough(), output = new PassThrough(); let text = '';
+    input.isTTY = true; input.setRawMode = () => input;
+    output.isTTY = true; output.columns = 140; output.rows = 40;
+    output.on('data', (d) => { text += d; });
+    const result = guidedRun({ input, output, options: { ...base, driveList: [{ drive: here, free: 5e9, total: 9e9 }, { drive: 'Q:', free: 1e9, total: 2e9 }] } });
+    for (const k of pressed) input.write(k);
+    input.end();
+    return { result: await result, plain: text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '') };
+  };
+  const DOWN = '\x1b[B', ENTER = '\r';
+  const project1 = await run([DOWN, DOWN, ENTER, 'q']);
+  assert.match(project1.plain, /Where should it look\?/);
+  assert.match(project1.plain, /This computer +everything AI coding tools left/);
+  assert.match(project1.plain, /can be freed in this project/);
+  assert.doesNotMatch(project1.plain, /Claude Code: shell snapshots/);
+  const drives = await run([DOWN, ENTER, ENTER, DOWN, ' ', ENTER, 'q']);
+  assert.match(drives.plain, /Which drives\?/);
+  assert.match(drives.plain, /No drive is selected\. Press Space on a drive\./);
+  assert.match(drives.plain, /Nothing to free on drive Q:/);
+});
+
+test('not ready: uncommitted work goes to a coding agent, is checked afterwards, and the list updates', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const wip = join(m.root, 'wt', 'wip');
+  g(['worktree', 'add', '-q', '-b', 'wip', wip], repo);
+  await writeFile(join(wip, 'feature.js'), 'half done');
+  await ageTree(wip, 5);
+  const base = { ...m.options, cwd: repo, home: m.home, now: Date.now() + 2 * DAY, scope: { kind: 'computer' } };
+
+  // The plan: not ready, never preselected, with the git identity the folder commits as.
+  const plan = await guidedPlan(base);
+  const item = plan.items.find((i) => i.notReady);
+  assert.deepEqual([item.key, item.selected, item.changed, item.identity.email], ['work:app:wip', false, 1, 't@example.com']);
+  const text = formatForAgent(plan);
+  assert.match(text, /Not ready yet \(uncommitted work\):\n +\[ \] +work:app:wip/);
+  assert.match(text, /never change git config, never pass --author, never push/);
+  assert.match(text, /commits as t <t@example\.com>/);
+  assert.match(text, /record --project=<folder> --summary=/);
+  assert.match(text, /--scope=computer --apply=<names/);
+
+  // Ground truth after the agent: work that vanished without a commit is flagged, never called ready.
+  g(['stash', '-u', '-q'], wip);
+  assert.equal(await recheckWork(plan), true);
+  assert.deepEqual([item.notReady, item.selected], [true, false]);
+  assert.match(item.warn, /gone but nothing was committed/);
+  g(['stash', 'pop', '-q'], wip);
+  // A commit under another account is accepted but said out loud.
+  const plan2 = await guidedPlan(base), item2 = plan2.items.find((i) => i.notReady);
+  g(['add', '-A'], wip); g(['-c', 'user.email=other@example.com', 'commit', '-q', '-m', 'wrong account'], wip);
+  await recheckWork(plan2);
+  assert.deepEqual([item2.notReady, item2.selected], [false, true]);
+  assert.match(item2.warn, /committed as other@example\.com, this folder's identity is t@example\.com/);
+  g(['reset', '-q', '--soft', 'HEAD~1'], wip); g(['reset', '-q'], wip);
+
+  // In a terminal: hand the folder to an agent installed here. A stand-in agent reads the task and commits.
+  const script = join(m.root, 'fake-agent.cjs'), seen = join(m.root, 'task-seen.md');
+  await writeFile(script, `const { execFileSync } = require('node:child_process'); let s = '';
+process.stdin.on('data', (d) => { s += d; }).on('end', () => { require('node:fs').writeFileSync(${JSON.stringify(seen)}, s);
+  execFileSync('git', ['add', '-A']); execFileSync('git', ['commit', '-q', '-m', 'agent: finish the feature']); console.log('committed the feature'); });`);
+  const agents = [{ name: 'Stand-in Agent', bin: process.execPath, direct: true, stdin: true, args: () => [script] }];
+  const { PassThrough } = await import('node:stream');
+  const start = (extra = {}) => {
+    const input = new PassThrough(), output = new PassThrough(); const state = { text: '' };
+    input.isTTY = true; input.setRawMode = () => input;
+    output.isTTY = true; output.columns = 160; output.rows = 50;
+    output.on('data', (d) => { state.text += d; });
+    const plain = () => state.text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+    const until = async (pattern) => { for (let i = 0; i < 150; i++) { if (pattern.test(plain())) return; await new Promise((r) => setTimeout(r, 100)); } assert.fail(`never showed ${pattern}:\n${plain()}`); };
+    return { input, plain, until, result: guidedRun({ input, output, options: { ...base, agents, ...extra } }) };
+  };
+  const ENTER = '\r', DOWN = '\x1b[B';
+  const run = start();
+  await run.until(/1 worktree\(s\) are not ready/);
+  assert.match(run.plain(), /Hand them to Stand-in Agent now/);
+  run.input.write(ENTER);                       // hand it over
+  await run.until(/wip: committed/);
+  await run.until(/wip \(app\) +work committed, ready: save, then remove/);
+  run.input.write(ENTER);                       // continue with the list (the folder is now selected)
+  await run.until(/Yes: save the work of 1 folder/);
+  assert.match(run.plain(), /saved[\\/]app-.*\.bundle/, 'the file the work goes into is named before anything is removed');
+  run.input.write(ENTER);                       // yes
+  run.input.end();
+  const done = await run.result;
+  assert.equal(done.done, true, run.plain());
+  const { readFile } = await import('node:fs/promises');
+  const task = await readFile(seen, 'utf8');
+  assert.match(task, /never change git config, never pass --author, never push/);
+  assert.ok(task.includes(wip));
+  assert.equal(g(['log', '-1', '--format=%s %ae', 'wip'], repo), 'agent: finish the feature t@example.com', 'the commit is on the branch, as the folder\'s own account');
+  assert.equal(await exists(wip), false, 'then the folder was saved and removed');
+
+  // Or: copy the task for the person's own agent. The list then updates by itself when that agent commits.
+  const wip2 = join(m.root, 'wt', 'wip2');
+  g(['worktree', 'add', '-q', '-b', 'wip2', wip2], repo);
+  await writeFile(join(wip2, 'other.js'), 'half done');
+  await ageTree(wip2, 5);
+  let copied = '';
+  const own = start({ agents: [], copy: (t) => { copied = t; return true; } });
+  await own.until(/Copy the task for my own agent/);
+  own.input.write(ENTER);                       // with no agent installed, the first choice is the copy
+  await own.until(/The task is on the clipboard and saved in/);
+  assert.ok(copied.includes(wip2));
+  assert.match(own.plain(), /Not ready yet: uncommitted work/);
+  g(['add', '-A'], wip2); g(['commit', '-q', '-m', 'done by my own agent'], wip2);
+  await own.until(/wip2 \(app\) +work committed, ready/);   // nobody pressed a key: it looked again by itself
+  own.input.write('q'); own.input.end();
+  assert.equal((await own.result).done, false);
+  assert.equal(await exists(wip2), true);
+});
+
+test('record: an agent says what the work was and which context matters; every file is still kept whole', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const tree = join(m.root, 'wt', 'topic');
+  g(['worktree', 'add', '-q', '-b', 'topic', tree], repo);
+  await writeFile(join(tree, 'work.js'), 'the work');
+  await aged(join(tree, '.claude', 'plan.md'), 0, 'the plan that explains the work');
+  await aged(join(tree, '.tmp-notes.txt'), 0, 'scratch');
+  await aged(join(tree, 'screenshot-1.png'), 0, 'png');
+  await assert.rejects(recordReview(tree, { summary: '', relevant: 'all' }, { home: m.home }), /a summary is needed/);
+  await assert.rejects(recordReview(tree, { summary: 'x', relevant: ['nope.md'] }, { home: m.home }), /not found in this folder: nope\.md/);
+  await assert.rejects(recordReview(tree, { summary: 'x', relevant: ['../outside'] }, { home: m.home }), /not found in this folder/);
+  const review = await recordReview(tree, { summary: 'Adds the topic feature; half done, tests missing.', relevant: ['.claude/plan.md'] }, { home: m.home });
+  assert.deepEqual(review.relevant, ['.claude/plan.md']);
+
+  const saved = await saveFolder(tree, { home: m.home });
+  assert.equal(saved.saved, true);
+  assert.deepEqual([saved.summary, saved.reviewed, saved.madeBy], ['Adds the topic feature; half done, tests missing.', true, 'git command']);
+  // The agent's call is a label. Nothing it left unmarked is dropped.
+  assert.deepEqual(saved.extras.files.map((f) => [f.rel, f.role, f.relevant]).sort(),
+    [['.claude/plan.md', 'context', true], ['.tmp-notes.txt', 'scratch', false], ['screenshot-1.png', 'scratch', false]]);
+  assert.deepEqual([saved.parts.work, saved.parts.context, saved.parts.scratch, saved.parts.relevant, saved.parts.tooLarge], [1, 1, 2, 1, []]);
+  assert.deepEqual(g(['ls-tree', '-r', '--name-only', saved.snapshot], repo).split('\n').sort(), ['a.txt', 'work.js'], 'the work snapshot holds work only');
+  g(['worktree', 'remove', '--force', tree], repo);
+  const back = await restoreSaved(saved.id, { home: m.home });
+  assert.equal(back.restored, true);
+  for (const rel of ['work.js', '.claude/plan.md', '.tmp-notes.txt', 'screenshot-1.png']) assert.equal(await exists(join(tree, rel)), true, rel);
+});
+
 test('guided for an agent: the bare command lists named items and how to apply; --apply does only what was named', async () => {
   const m = await machine();
   const { g, repo } = await project(m);
@@ -1021,14 +1201,24 @@ test('guided for an agent: the bare command lists named items and how to apply; 
     XDG_CONFIG_HOME: m.config, XDG_CACHE_HOME: join(m.root, 'xdg-cache'), CLAUDE_CONFIG_DIR: join(m.home, '.claude'), CODEX_HOME: join(m.home, '.codex'),
     PLAYWRIGHT_BROWSERS_PATH: join(local, 'ms-playwright'), npm_config_cache: join(m.root, 'npm-cache'), CODEIN_TIDY_PROFILE: '' };
   const run = (...args) => spawnSync(process.execPath, [join(process.cwd(), 'tidy.mjs'), ...args], { cwd: repo, env, encoding: 'utf8', input: '' });
-  const listed = run();
+  // First the scope: the choices and the command for each, nothing measured yet.
+  const asked = run();
+  assert.equal(asked.status, 0, asked.stderr);
+  assert.match(asked.stdout, /choose the scope first\. Ask the person/);
+  assert.match(asked.stdout, /--scope=computer/);
+  assert.match(asked.stdout, /--scope=project +only this project/);
+  assert.doesNotMatch(asked.stdout, /cleanup:claude-code/);
+  assert.equal(run('--scope=nonsense').status, 2);
+  const listed = run('--scope=computer');
   assert.equal(listed.status, 0, listed.stderr);
   assert.match(listed.stdout, /cleanup:claude-code/);
+  assert.match(listed.stdout, /--scope=computer --apply=<names/);
+  assert.doesNotMatch(run('--scope=project').stdout, /cleanup:claude-code/);
   assert.match(listed.stdout, /Never run --apply without the person's answer/);
   const json = JSON.parse(run('--json').stdout);
   assert.ok(json.some((i) => i.key === 'cleanup:claude-code' && i.suggested === true));
-  // The worktree is used today (just made), so it is not offered; the named item alone is done.
-  const applied = run('--apply=cleanup:claude-code,history');
+  // The worktree was changed minutes ago (in use now), so it is not offered; the named item alone is done.
+  const applied = run('--scope=computer', '--apply=cleanup:claude-code,history');
   assert.equal(applied.status, 0, applied.stderr);
   assert.match(applied.stdout, /Not found now .*history/);
   assert.match(applied.stdout, /Done\. About .* freed\./);
