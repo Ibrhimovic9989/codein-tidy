@@ -366,7 +366,7 @@ export async function unfinishedWork(options = {}) {
       return { ...f, madeBy: madeBy(f.path, f.main), stage, changed: work.length, sample: work.slice(0, 5), leftovers, unpushed: unpushed ?? 0,
         idleDays: Math.max(0, Math.floor(((options.now ?? Date.now()) - touched) / DAY)), lastCommit: subject };
     });
-    projects.push({ name: basename(main), main, release, hasRemote, live: 'not checked', folders: rows });
+    projects.push({ name: basename(main), main, release, hasRemote, live: 'not checked', budget: await projectBudget(main), folders: rows });
   }
   return projects;
 }
@@ -400,7 +400,10 @@ export function formatWork(projects) {
 export function formatNotice(projects) {
   const p = projects[0];
   const open = p ? p.folders.filter((f) => STAGE_ORDER.includes(f.stage) && f.stage !== 'unreadable') : [];
-  if (!open.length) return '';
+  const linked = p ? p.folders.filter((f) => !f.main).length : 0;
+  const overBudget = p && p.budget && linked > p.budget
+    ? `This project has ${linked} worktrees; its budget is ${p.budget}. Do not create more: take a working folder with \`npx -y codein-tidy@latest slot take --branch=<name>\`, and offer the person \`npx -y codein-tidy@latest close\`, which saves the work and frees idle ones.` : '';
+  if (!open.length) return overBudget;
   const count = (s) => open.filter((f) => f.stage === s).length;
   const parts = [['uncommitted', 'hold uncommitted work'], ['not pushed', 'hold commits that are not pushed'], ['no remote', 'hold commits (no remote)'], ['not merged', `are pushed but not in ${p.release}`]]
     .filter(([s]) => count(s)).map(([s, t]) => `${count(s)} ${t}`);
@@ -410,6 +413,7 @@ export function formatNotice(projects) {
     ...(open.length > top.length ? [`- and ${open.length - top.length} more: npx codein-tidy work`] : []),
     'Tell the person about this unfinished work before starting something new, and offer to finish it. Never delete, reset or stash it.',
     'To finish one: read it (git -C <folder> status, git -C <folder> diff), commit it on its branch with a clear message, then ask the person before pushing or merging.',
+    ...(overBudget ? [overBudget] : []),
   ].join('\n');
 }
 
@@ -871,7 +875,10 @@ const sha256 = async (path) => createHash('sha256').update(await fs.readFile(pat
 
 /** The tree of a folder exactly as it is now, built in a throwaway index. Null if git cannot build it. */
 function folderTree(top, excluded = []) {
-  const scratch = join(tmpdir(), `codein-tidy-index-${process.pid}-${randomUUID()}`);
+  // The throwaway index lives in the checkout's own git folder: it always exists and is on the same drive.
+  const gitDir = git(['rev-parse', '--absolute-git-dir'], top);
+  if (!gitDir) return null;
+  const scratch = join(gitDir, `codein-tidy-index-${process.pid}-${randomUUID()}`);
   const env = { GIT_INDEX_FILE: scratch };
   try {
     // Start from a copy of the folder's own index: git's file-time cache means only changed files are hashed
@@ -1333,6 +1340,99 @@ export function formatDeps(report) {
   return lines.join('\n').trimEnd() || 'No installs found.';
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Guard: the backstop no harness can skip. Run by the operating system's scheduler once a day, it checks every
+// known project against its budget. notify (default) records which are over budget; close saves and closes the
+// oldest idle worktrees until the project is back inside its budget. Known projects: those with slots, those
+// registered with `guard --install --project=PATH`, and those the tools' worktrees belong to.
+// ---------------------------------------------------------------------------------------------------------------
+async function knownProjects(options) {
+  const mains = new Set((await listSlots(options)).map((p) => p.main));
+  const registered = JSON.parse(await fs.readFile(join(tidyHome(options), 'projects.json'), 'utf8').catch(() => '[]'));
+  for (const p of registered) mains.add(p);
+  const seeds = [...mains];
+  for (const t of targets(options).filter((t) => t.kind === 'worktrees')) seeds.push(...await findWorktrees(t.path, 2));
+  const out = new Map();
+  for (const seed of seeds) { try { const p = projectOf(seed); if (await lstat(p.main)) out.set(p.common, p); } catch {} }
+  return [...out.values()];
+}
+
+export async function guardRun(options = {}) {
+  const mode = options.mode ?? 'notify', now = options.now ?? Date.now();
+  const results = [];
+  for (const p of await knownProjects(options)) {
+    const budget = await projectBudget(p.main);
+    const entry = { name: basename(p.main), main: p.main, linked: p.linked.length, budget, over: Math.max(0, p.linked.length - budget), closed: 0, saved: 0, failed: [] };
+    if (entry.over && mode === 'close') {
+      const plan = await closePlan({ ...options, cwd: p.main, idleDays: options.idleDays ?? 1, now });
+      plan.candidates.sort((a, b) => b.idleDays - a.idleDays);
+      plan.candidates = plan.candidates.slice(0, entry.over); // only as many as needed, oldest first
+      const receipt = await closeFolders(plan, options);
+      Object.assign(entry, { closed: receipt.closed.length, saved: receipt.saved.length, failed: receipt.failed, freed: receipt.freed });
+      entry.linked -= receipt.closed.length; entry.over = Math.max(0, entry.linked - budget);
+    }
+    results.push(entry);
+  }
+  const record = { checkedAt: new Date(now).toISOString(), mode, projects: results };
+  await fs.mkdir(tidyHome(options), { recursive: true });
+  await fs.writeFile(join(tidyHome(options), 'guard.json'), JSON.stringify(record, null, 2));
+  return record;
+}
+
+/** The scheduler entry for this operating system: what install runs, shown as is by --dry-run. */
+export function guardSchedule({ os = platform(), home = homedir(), node = process.execPath, mode = 'notify' } = {}) {
+  const script = join(home, '.codein-tidy', 'bin', 'tidy.mjs');
+  const run = [node, script, 'guard', '--run', `--mode=${mode}`];
+  if (os === 'win32') {
+    const action = run.map((part) => (part.includes(' ') ? `"${part}"` : part)).join(' ');
+    return { script, install: [['schtasks', ['/Create', '/F', '/SC', 'DAILY', '/ST', '12:30', '/TN', 'codein-tidy-guard', '/TR', action]]],
+      uninstall: [['schtasks', ['/Delete', '/F', '/TN', 'codein-tidy-guard']]] };
+  }
+  if (os === 'darwin') {
+    const plist = join(home, 'Library', 'LaunchAgents', 'in.code.codein-tidy-guard.plist');
+    const body = `<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict><key>Label</key><string>in.code.codein-tidy-guard</string><key>ProgramArguments</key><array>${run.map((a) => `<string>${a}</string>`).join('')}</array><key>StartCalendarInterval</key><dict><key>Hour</key><integer>12</integer><key>Minute</key><integer>30</integer></dict></dict></plist>\n`;
+    return { script, file: { path: plist, body }, install: [['launchctl', ['load', '-w', plist]]], uninstall: [['launchctl', ['unload', '-w', plist]]] };
+  }
+  const line = `30 12 * * * ${run.map((a) => `'${a}'`).join(' ')} # codein-tidy-guard`;
+  return { script, cron: line, install: [], uninstall: [] };
+}
+
+export async function guardInstall(options = {}) {
+  const s = guardSchedule(options);
+  const steps = [`copy this tool to ${s.script}`, ...(s.file ? [`write ${s.file.path}`] : []), ...(s.cron ? [`add to your crontab: ${s.cron}`] : []),
+    ...s.install.map(([c, a]) => `${c} ${a.join(' ')}`), ...(options.project ? [`register ${resolve(options.project)}`] : [])];
+  if (options.dryRun) return { steps, applied: false };
+  await fs.mkdir(join(s.script, '..'), { recursive: true });
+  await fs.copyFile(new URL(import.meta.url), s.script);
+  if (s.file) { await fs.mkdir(join(s.file.path, '..'), { recursive: true }); await fs.writeFile(s.file.path, s.file.body); }
+  if (s.cron) {
+    const current = (() => { try { return execFileSync('crontab', ['-l'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }); } catch { return ''; } })();
+    const next = current.split('\n').filter((l) => l && !l.includes('# codein-tidy-guard')).concat(s.cron).join('\n') + '\n';
+    execFileSync('crontab', ['-'], { input: next });
+  }
+  for (const [command, args] of s.install) execFileSync(command, args, { stdio: 'ignore' });
+  if (options.project) {
+    const file = join(tidyHome(options), 'projects.json');
+    const list = JSON.parse(await fs.readFile(file, 'utf8').catch(() => '[]'));
+    const main = projectOf(options.project).main;
+    if (!list.includes(main)) await fs.writeFile(file, JSON.stringify([...list, main], null, 2));
+  }
+  return { steps, applied: true };
+}
+
+export async function guardUninstall(options = {}) {
+  const s = guardSchedule(options);
+  for (const [command, args] of s.uninstall) { try { execFileSync(command, args, { stdio: 'ignore' }); } catch {} }
+  if (s.file) await fs.rm(s.file.path, { force: true });
+  if (s.cron) {
+    try {
+      const current = execFileSync('crontab', ['-l'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+      execFileSync('crontab', ['-'], { input: current.split('\n').filter((l) => l && !l.includes('# codein-tidy-guard')).join('\n') + '\n' });
+    } catch {}
+  }
+  return { removed: true };
+}
+
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
 export async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -1343,7 +1443,25 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps'];
+  const positional = argv.filter((a) => !a.startsWith('--'));
+  const value = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : undefined; };
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps', 'guard'];
+  if (command === 'guard') {
+    const mode = value('mode') ?? 'notify';
+    if (!['notify', 'close'].includes(mode)) { console.error('--mode must be notify or close'); process.exitCode = 2; return; }
+    if (args.has('--install')) {
+      const r = await guardInstall({ ...options, mode, dryRun: args.has('--dry-run') });
+      console.log(`${r.applied ? 'Installed' : 'Would do (nothing changed)'}:\n${r.steps.map((s) => `  ${s}`).join('\n')}`);
+      if (r.applied) console.log(`The guard runs daily in ${mode} mode. Remove it with: codein-tidy guard --uninstall`);
+    } else if (args.has('--uninstall')) { await guardUninstall(options); console.log('Removed the daily guard.'); }
+    else {
+      const r = await guardRun({ ...options, mode });
+      if (args.has('--json')) { console.log(JSON.stringify(r, null, 2)); return; }
+      for (const p of r.projects) console.log(`${p.name}: ${p.linked} worktree(s), budget ${p.budget}${p.over ? `, ${p.over} over` : ', within budget'}${p.closed ? `; closed ${p.closed} (work saved from ${p.saved})` : ''}${p.failed.length ? `; could not close ${p.failed.length}` : ''}.`);
+      if (!r.projects.length) console.log('No known projects yet. Register one: codein-tidy guard --install --project=PATH');
+    }
+    return;
+  }
   if (command === 'deps') {
     const report = await depsReport({ ...options, all: args.has('--all') });
     console.log(args.has('--json') ? JSON.stringify(report, null, 2) : formatDeps(report));
@@ -1366,7 +1484,6 @@ export async function main(argv) {
     else console.log(RULES_BLOCK);
     return;
   }
-  const value = (name) => { const a = argv.find((x) => x.startsWith(`--${name}=`)); return a ? a.slice(name.length + 3) : undefined; };
   if (command === 'slot') {
     const action = positional[1];
     try {
@@ -1385,7 +1502,6 @@ export async function main(argv) {
     } catch (error) { console.error(String(error.message ?? error)); process.exitCode = error.code === 'OVER_BUDGET' ? 3 : 1; }
     return;
   }
-  const positional = argv.filter((a) => !a.startsWith('--'));
   if (!COMMANDS.includes(command) || (older && !(options.olderThanDays >= 1)) || (['prepare', 'save'].includes(command) && !options.project)
       || (command === 'restore' && !positional[1])) {
     console.error('Usage: codein-tidy [report | work [--all] [--notice] | save --project=PATH [--yes] | saved | restore ID [--to=PATH] | review | prepare --project=PATH [--yes] | clean [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');

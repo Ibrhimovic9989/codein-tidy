@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps } from './tidy.mjs';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -504,7 +504,8 @@ test('work: every folder of a project by stage; leftovers are never counted as w
     g(['checkout', '-q', 'main'], repo); g(['merge', '-q', '--no-edit', branch], repo);
   }
   g(['push', '-q', 'origin', 'main'], repo);
-  assert.equal(formatNotice(await unfinishedWork({ ...m.options, cwd: repo })), '');
+  // Nothing unfinished is listed any more (4 worktrees is over the default budget of 3, which the notice still says).
+  assert.equal(formatNotice(await unfinishedWork({ ...m.options, cwd: repo })).includes('unfinished work'), false);
 });
 
 test('work: a project without a remote, and the release branch from .codein-tidy.json', async () => {
@@ -748,4 +749,71 @@ test('deps: shared installs are proven by link counts; copies are measured with 
   const [pnpm] = await depsReport({ ...m.options, cwd: pnpmRepo, smallBytes: 0 });
   assert.deepEqual(pnpm.installs.map((i) => [i.ecosystem, i.shared, i.copiedBytes]), [['pnpm', true, 0]]);
   assert.match(formatDeps([pnpm]), /Nothing to fix/);
+});
+
+test('guard close mode brings a project back inside its budget unattended, oldest idle first, work saved', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.codein-tidy.json'), JSON.stringify({ budget: 1 }));
+  await writeFile(join(repo, '.git', 'info', 'exclude'), '.codein-tidy.json\n');
+  const { utimes } = await import('node:fs/promises');
+  const make = async (name, ageDays, dirty) => {
+    const tree = join(m.root, 'wt', name);
+    g(['worktree', 'add', '-q', '-b', name, tree], repo);
+    // Idle time counts the last commit too: give each folder a commit from its own day.
+    const date = new Date(Date.now() - ageDays * DAY).toISOString();
+    execFileSync('git', ['commit', '-q', '--allow-empty', '-m', name], { cwd: tree, env: { ...process.env, GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date }, stdio: 'ignore' });
+    if (dirty) await writeFile(join(tree, 'work.js'), name);
+    const when = new Date(Date.now() - ageDays * DAY);
+    for (const f of await (await import('node:fs/promises')).readdir(tree)) await utimes(join(tree, f), when, when);
+    await utimes(tree, when, when);
+    return tree;
+  };
+  const oldest = await make('oldest', 20, true), middle = await make('middle', 10, false), newest = await make('newest', 5, true);
+  // Registered as a known project; the commits are new, so judge idleness by "now" a month ahead of the folders.
+  await (await import('node:fs/promises')).mkdir(join(m.home, '.codein-tidy'), { recursive: true });
+  await writeFile(join(m.home, '.codein-tidy', 'projects.json'), JSON.stringify([repo]));
+  const notify = await guardRun({ ...m.options, home: m.home, mode: 'notify' });
+  assert.deepEqual(notify.projects.map((p) => [p.linked, p.budget, p.over, p.closed]), [[3, 1, 2, 0]]);
+  assert.equal(await exists(oldest), true, 'notify changes nothing');
+  const run = await guardRun({ ...m.options, home: m.home, mode: 'close', now: Date.now() + 2 * DAY });
+  assert.deepEqual(run.projects.map((p) => [p.linked, p.over, p.closed]), [[1, 0, 2]]);
+  assert.deepEqual([await exists(oldest), await exists(middle), await exists(newest)], [false, false, true]);
+  const saved = await savedList({ home: m.home });
+  assert.ok(saved.some((r) => r.path === oldest), 'the oldest folder held work: it was saved before it was closed');
+  const { readFile } = await import('node:fs/promises');
+  assert.equal(JSON.parse(await readFile(join(m.home, '.codein-tidy', 'guard.json'), 'utf8')).mode, 'close');
+});
+
+test('guard install: the scheduler entry for each operating system, and a dry run that changes nothing', async () => {
+  const win = guardSchedule({ os: 'win32', home: 'C:/Users/me', node: 'C:/Program Files/nodejs/node.exe' });
+  assert.deepEqual(win.install[0][1].slice(0, 9), ['/Create', '/F', '/SC', 'DAILY', '/ST', '12:30', '/TN', 'codein-tidy-guard', '/TR']);
+  // The node path holds a space, so it is quoted; the script path is under the given home.
+  assert.ok(win.install[0][1][9].startsWith('"C:/Program Files/nodejs/node.exe" '), win.install[0][1][9]);
+  assert.ok(win.install[0][1][9].endsWith(' guard --run --mode=notify'), win.install[0][1][9]);
+  assert.ok(win.install[0][1][9].includes(join('C:/Users/me', '.codein-tidy', 'bin', 'tidy.mjs')), win.install[0][1][9]);
+  const mac = guardSchedule({ os: 'darwin', home: '/Users/me', node: '/usr/local/bin/node', mode: 'close' });
+  assert.match(mac.file.body, /<string>guard<\/string><string>--run<\/string><string>--mode=close<\/string>/);
+  const linux = guardSchedule({ os: 'linux', home: '/home/me', node: '/usr/bin/node' });
+  assert.match(linux.cron, /^30 12 \* \* \* '\/usr\/bin\/node' .*'guard' '--run' '--mode=notify' # codein-tidy-guard$/);
+  const m = await machine();
+  const dry = await guardInstall({ home: m.home, dryRun: true });
+  assert.equal(dry.applied, false);
+  assert.equal(await exists(join(m.home, '.codein-tidy', 'bin', 'tidy.mjs')), false);
+});
+
+test('every command runs through the real command line (sealed environment)', async () => {
+  const m = await machine();
+  const { repo } = await project(m);
+  const local = join(m.root, 'local'), roaming = join(m.root, 'roaming');
+  const env = { ...process.env, HOME: m.home, USERPROFILE: m.home, TEMP: m.temp, TMP: m.temp, TMPDIR: m.temp, APPDATA: roaming, LOCALAPPDATA: local,
+    XDG_CONFIG_HOME: m.config, XDG_CACHE_HOME: join(m.root, 'xdg-cache'), CLAUDE_CONFIG_DIR: join(m.home, '.claude'), CODEX_HOME: join(m.home, '.codex'),
+    PLAYWRIGHT_BROWSERS_PATH: join(local, 'ms-playwright'), npm_config_cache: join(m.root, 'npm-cache'), CODEIN_TIDY_PROFILE: '' };
+  const run = (...args) => { const r = spawnSync(process.execPath, [join(process.cwd(), 'tidy.mjs'), ...args], { cwd: repo, env, encoding: 'utf8', input: '' }); return r; };
+  for (const args of [['work'], ['work', '--notice'], ['saved'], ['slot', 'list'], ['slot', 'take', '--branch=cli-task'], ['slot', 'list'], ['rules'], ['deps'],
+    ['guard'], ['guard', '--install', '--dry-run'], ['close'], [`save`, `--project=${repo}`], ['guard-shell'], ['review']]) {
+    const r = run(...args);
+    assert.equal(r.status, 0, `${args.join(' ')}: ${r.stderr}`);
+  }
+  assert.match(run('slot', 'list').stdout, /cli-task/);
 });
