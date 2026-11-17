@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -717,4 +717,35 @@ test('rules: added to AGENTS.md once, updated in place, other text kept', async 
   assert.ok(text.startsWith('# Project rules\n\nUse tabs.\n\n<!-- codein-tidy:start -->'));
   assert.equal(text.split('codein-tidy:start').length, 2);
   assert.ok(text.includes(RULES_BLOCK));
+});
+
+test('deps: shared installs are proven by link counts; copies are measured with the cause and the fix', async () => {
+  const m = await machine();
+  const { link } = await import('node:fs/promises');
+  const g = (args, cwd) => execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+  const make = async (name, lock) => {
+    const repo = join(m.root, name);
+    g(['init', '-q', repo], m.root);
+    for (const [k, v] of [['user.email', 't@example.com'], ['user.name', 't'], ['commit.gpgsign', 'false']]) g(['config', k, v], repo);
+    await writeFile(join(repo, lock), 'lock'); await writeFile(join(repo, '.gitignore'), 'node_modules/\n');
+    g(['add', '.'], repo); g(['commit', '-q', '-m', 'init'], repo);
+    return repo;
+  };
+  // npm: real copies, at the top and in a workspace package; a dot folder's install is not the project's.
+  const npmRepo = await make('npmapp', 'package-lock.json');
+  for (const dir of ['node_modules', join('apps', 'web', 'node_modules'), join('.vscode-test', 'app', 'node_modules')])
+    for (let i = 0; i < 4; i++) await aged(join(npmRepo, dir, `pkg${i}`, 'index.js'), 0, 'n'.repeat(2000));
+  const [npm] = await depsReport({ ...m.options, cwd: npmRepo, smallBytes: 0 });
+  assert.deepEqual(npm.installs.map((i) => [i.ecosystem, i.shared, i.copiedBytes]).sort(), [['npm', false, 8000], ['npm', false, 8000]]);
+  assert.match(formatDeps([npm]), /2 npm install\(s\), 16 KB: npm has no shared store/);
+  // pnpm: package files hard-linked to a store are shared.
+  const pnpmRepo = await make('pnpmapp', 'pnpm-lock.yaml');
+  for (let i = 0; i < 4; i++) {
+    const file = join(pnpmRepo, 'node_modules', '.pnpm', `pkg${i}@1.0.0`, 'node_modules', `pkg${i}`, 'index.js');
+    await aged(join(m.root, 'store', `f${i}`), 0, 's'.repeat(3000));
+    await mkdir(join(file, '..'), { recursive: true }); await link(join(m.root, 'store', `f${i}`), file);
+  }
+  const [pnpm] = await depsReport({ ...m.options, cwd: pnpmRepo, smallBytes: 0 });
+  assert.deepEqual(pnpm.installs.map((i) => [i.ecosystem, i.shared, i.copiedBytes]), [['pnpm', true, 0]]);
+  assert.match(formatDeps([pnpm]), /Nothing to fix/);
 });

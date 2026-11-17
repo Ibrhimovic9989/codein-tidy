@@ -1250,6 +1250,89 @@ export async function writeRules(project) {
   return { file, changed: next !== text };
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Shared dependencies: install once, link everywhere. For every working folder of a project, find each install,
+// prove from sampled link counts whether it is shared with a store or a private copy, measure what is copied,
+// and say why and how to share it. One small table per ecosystem, found from the lockfile; nothing is changed.
+// ---------------------------------------------------------------------------------------------------------------
+const ECOSYSTEMS = [
+  { name: 'pnpm', lock: 'pnpm-lock.yaml', dir: 'node_modules', sample: '.pnpm',
+    copied: (f) => f.storeDrive && f.storeDrive !== f.drive
+      ? `pnpm's store is on ${f.storeDrive}, this folder on ${f.drive}; hard links cannot cross drives. Put a store on ${f.drive}: pnpm config set store-dir ${f.drive}\\.pnpm-store, then pnpm install.`
+      : 'pnpm copied instead of linking: check package-import-method (pnpm config get package-import-method) and set it to hardlink or auto, then pnpm install.' },
+  { name: 'npm', lock: 'package-lock.json', dir: 'node_modules', copied: () => 'npm has no shared store: every folder holds its own copy. Reuse folders (codein-tidy slot take) or switch the project to pnpm.' },
+  { name: 'Yarn', lock: 'yarn.lock', dir: 'node_modules', copied: () => 'Yarn node_modules are copies per folder. Reuse folders (codein-tidy slot take), or use Yarn PnP or pnpm.' },
+  { name: 'Bun', lock: ['bun.lockb', 'bun.lock'], dir: 'node_modules', copied: () => 'Bun copied the install: check its backend (bun install --backend=hardlink).' },
+  { name: 'uv', lock: 'uv.lock', dir: '.venv', copied: () => 'uv copied the packages: set UV_LINK_MODE=hardlink and keep uv\'s cache (uv cache dir) on the same drive.' },
+  { name: 'Poetry', lock: 'poetry.lock', dir: '.venv', copied: () => 'Poetry environments are copies per folder. Reuse folders (codein-tidy slot take), or use uv with UV_LINK_MODE=hardlink.' },
+  { name: 'pip', lock: 'requirements.txt', dir: ['.venv', 'venv'], copied: () => 'pip installs are copies per environment. Reuse folders (codein-tidy slot take), or use uv with UV_LINK_MODE=hardlink.' },
+  { name: 'Cargo', lock: 'Cargo.lock', dir: 'target', copied: () => 'Each folder builds its own target. Share one: set CARGO_TARGET_DIR to one folder, or reuse folders (codein-tidy slot take).' },
+];
+const driveOf = (path) => (/^([A-Za-z]:)/.exec(resolve(path))?.[1] ?? '/').toUpperCase();
+
+export async function depsReport(options = {}) {
+  const projects = await unfinishedWork({ ...options, cwd: options.project ?? options.cwd ?? process.cwd() });
+  const out = [];
+  for (const p of projects) {
+    const storeAsk = (dir) => { try { return runTool('pnpm', ['store', 'path'], { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 20_000 }).trim().split(/\r?\n/).pop(); } catch { return null; } };
+    const stores = new Map();
+    const installs = [];
+    // Installs at the folder's top and in workspace packages (apps/api/node_modules), never inside another install
+    // or a dot folder (.vscode-test holds a downloaded app, not this project's dependencies).
+    const installDirs = async (root, names) => {
+      const found = [];
+      const walk = async (dir, depth) => {
+        for (const e of await fs.readdir(dir, { withFileTypes: true }).catch(() => [])) {
+          if (!e.isDirectory() || e.isSymbolicLink() || e.name.startsWith('.')) continue;
+          if (names.includes(e.name)) { found.push(join(dir, e.name)); continue; }
+          if (depth < 3 && !REBUILT_DIRS.has(e.name)) await walk(join(dir, e.name), depth + 1);
+        }
+      };
+      await walk(root, 0);
+      return found;
+    };
+    await pool(p.folders, 4, async (f) => {
+      for (const eco of ECOSYSTEMS) {
+        const locks = [eco.lock].flat();
+        if (!(await Promise.all(locks.map((l) => lstat(join(f.path, l))))).some(Boolean)) continue;
+        for (const dir of await installDirs(f.path, [eco.dir].flat())) {
+          const sampleRoot = eco.sample && await lstat(join(dir, eco.sample)) ? join(dir, eco.sample) : dir;
+          const samples = await packageLinks(sampleRoot, 12);
+          const linked = samples.filter((n) => n >= 2n).length;
+          const shared = samples.length >= 3 && linked >= samples.length * 0.75;
+          const m = shared ? { bytes: 0, freeable: 0 } : await measure(dir);
+          const drive = driveOf(f.path);
+          if (eco.name === 'pnpm' && !shared && !stores.has(drive)) { const s = storeAsk(f.path); stores.set(drive, s); }
+          const storeDrive = eco.name === 'pnpm' && stores.get(drive) ? driveOf(stores.get(drive)) : null;
+          // A few megabytes of unlinked files is a partial install or files built on install, not a copy problem.
+          const small = !shared && m.freeable < (options.smallBytes ?? 50 * 1024 ** 2);
+          installs.push({ folder: f.path, main: f.main, ecosystem: eco.name, dir, shared: shared || small, small, samples: samples.length, linked,
+            copiedBytes: shared || small ? 0 : m.freeable, smallBytes: small ? m.freeable : 0, why: shared || small ? null : eco.copied({ drive, storeDrive }) });
+        }
+      }
+    });
+    installs.sort((a, b) => b.copiedBytes - a.copiedBytes);
+    out.push({ name: p.name, installs, copiedBytes: installs.reduce((s, i) => s + i.copiedBytes, 0) });
+  }
+  return out;
+}
+
+export function formatDeps(report) {
+  const lines = [];
+  for (const p of report) {
+    const copied = p.installs.filter((i) => !i.shared), shared = p.installs.filter((i) => i.shared);
+    const smallBytes = p.installs.reduce((s, i) => s + (i.smallBytes ?? 0), 0);
+    lines.push(`${p.name}: ${p.installs.length} install(s) in its working folders; ${shared.length} shared or small, ${copied.length} private copies holding ${size(p.copiedBytes)}.${smallBytes ? ` (Small unlinked parts, such as files built on install: ${size(smallBytes)}.)` : ''}`);
+    if (!copied.length) lines.push('  Nothing to fix: installs here are shared, so a new working folder costs little for dependencies. Fewer folders still save the rest.');
+    const reasons = new Map();
+    for (const i of copied) { const r = reasons.get(i.why) ?? { n: 0, bytes: 0, eco: i.ecosystem }; r.n += 1; r.bytes += i.copiedBytes; reasons.set(i.why, r); }
+    for (const [why, r] of reasons) lines.push(`  ${r.n} ${r.eco} install(s), ${size(r.bytes)}: ${why}`);
+    for (const i of copied.slice(0, 8)) lines.push(`    ${size(i.copiedBytes).padStart(8)}  ${i.dir}`);
+    lines.push('');
+  }
+  return lines.join('\n').trimEnd() || 'No installs found.';
+}
+
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
 export async function main(argv) {
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -1260,7 +1343,12 @@ export async function main(argv) {
   const options = { history: args.has('--history'), worktrees: args.has('--worktrees'), deep: args.has('--deep'), caches: args.has('--caches'),
     ...(project ? { project: project.includes('=') ? resolve(project.split('=').slice(1).join('=')) : process.cwd() } : {}),
     ...(older ? { olderThanDays: Number(older.split('=')[1]) } : {}) };
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps'];
+  if (command === 'deps') {
+    const report = await depsReport({ ...options, all: args.has('--all') });
+    console.log(args.has('--json') ? JSON.stringify(report, null, 2) : formatDeps(report));
+    return;
+  }
   if (command === 'guard-shell') {
     // Called by a harness's pre-shell hook with the tool call as JSON on stdin. Silent allow by default.
     try {
