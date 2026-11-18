@@ -1,6 +1,6 @@
 {
   "name": "codein-tidy",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "Find unfinished work agents left behind, and safely free the disk space AI coding tools use: Claude Code, Codex, Cursor, Antigravity.",
   "type": "module",
   "bin": {

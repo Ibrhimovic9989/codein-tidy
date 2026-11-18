@@ -1040,6 +1040,15 @@ test('scope: asked first; computer, chosen drives or this project only', async (
   assert.deepEqual(await keys({ kind: 'computer' }), ['cleanup:claude-code', 'leftovers', 'worktrees:app']);
   // This project only: its worktrees and leftovers, none of the tools' own data.
   assert.deepEqual(await keys({ kind: 'project' }), ['leftovers', 'worktrees:app']);
+  // A folder left over from ANOTHER project's close is not part of this project (seen on a real machine).
+  const other = join(m.root, 'other'), gone = join(m.root, 'wt', 'other-gone');
+  await mkdir(other, { recursive: true }); g(['init', '-q', '-b', 'main', other], m.root);
+  await aged(join(gone, 'node_modules', 'left.js'), 0);
+  await mkdir(join(m.home, '.codein-tidy'), { recursive: true });
+  await writeFile(join(m.home, '.codein-tidy', 'closed.jsonl'), JSON.stringify({ path: gone, common: join(other, '.git'), savedId: null, at: new Date().toISOString() }) + '\n');
+  assert.deepEqual(await keys({ kind: 'computer' }), ['cleanup:claude-code', 'leftovers', 'worktrees:app', 'worktrees:other']);
+  assert.deepEqual(await keys({ kind: 'project' }), ['leftovers', 'worktrees:app']);
+  await (await import('node:fs/promises')).rm(join(m.home, '.codein-tidy', 'closed.jsonl'));
   // Drives: only what sits on the named drives.
   const here = /^([A-Za-z]:)/.exec(m.root)?.[1].toUpperCase() ?? '/';
   assert.deepEqual(await keys({ kind: 'drives', drives: [here] }), ['cleanup:claude-code', 'leftovers', 'worktrees:app']);

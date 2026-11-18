@@ -1604,6 +1604,9 @@ export async function guardUninstall(options = {}) {
 const sumFree = (list) => list.reduce((s, x) => s + (x.freeable ?? 0), 0);
 const planFree = (p) => p.removable.reduce((s, e) => s + (e.freeable ?? 0), 0);
 
+// How the tool is run, for the commands it prints. A host CLI passes its own (code.in: `codein tidy`).
+let TOOL = 'npx -y codein-tidy@latest';
+
 // A folder changed in the last two hours may have an agent working in it right now: it is shown, never offered.
 const IN_USE_MS = 2 * 60 * 60_000, HANDOFF_DAYS = 7;
 const handoffFile = (options = {}) => join(tidyHome(options), 'handoff.json');
@@ -1657,6 +1660,8 @@ export async function guidedPlan(options = {}) {
   const top = git(['rev-parse', '--show-toplevel'], cwd);
   if (scope.kind === 'project' && !top) throw new Error(`${cwd} is not inside a git project: choose the computer or a drive instead`);
   const onScope = (path) => scope.kind !== 'drives' || scope.drives.includes(driveOf(path));
+  const commonHere = top ? resolve(git(['rev-parse', '--path-format=absolute', '--git-common-dir'], cwd) ?? '') : null;
+  const inProject = (x) => scope.kind !== 'project' || (x.common && resolve(x.common) === commonHere);
   const scanned = scope.kind === 'project' ? []
     : await scan({ ...options, cwd, history: true, caches: true, worktrees: false, ...(scope.kind === 'drives' ? { drives: scope.drives } : {}) });
   const items = [], notes = [], kept = [];
@@ -1665,7 +1670,7 @@ export async function guidedPlan(options = {}) {
   const handoff = await readHandoff(options);
   const ready = [], waiting = [];
   for (const x of [...close.folders, ...close.candidates.filter((c) => c.leftover)]) {
-    if (!onScope(x.path)) continue;
+    if (!onScope(x.path) || !inProject(x)) continue;
     if (x.leftover) { ready.push(x); continue; }
     if (x.keep && !x.keep.startsWith('used ')) { kept.push(x); continue; }
     if (x.stage === 'uncommitted') {
@@ -1779,7 +1784,7 @@ export function agentBrief(plan, { rerun, only } = {}) {
     '   If something should not be committed (secrets, huge generated files), leave that folder and say why.',
     '5. Then record what the work was, so it can be found again. Scratch and context files are all kept, whole;',
     '   name the ones that matter for understanding this work (or none):',
-    '   npx -y codein-tidy@latest record --project=<folder> --summary="<what this work was, in one or two sentences>" --relevant=<file,file|none|all>',
+    `   ${TOOL} record --project=<folder> --summary="<what this work was, in one or two sentences>" --relevant=<file,file|none|all>`,
     '',
     'Folders:',
   ];
@@ -1842,7 +1847,7 @@ export async function formatScopeQuestion(options = {}) {
   lines.push(`  --scope=computer      everything AI coding tools left on this computer${drives.length ? ` (${drives.map((d) => `${d.drive} ${size(d.free)} free`).join(', ')})` : ''}`);
   if (drives.length > 1) lines.push(`  --scope=drive:${drives[0].drive[0]}       only the drives named, one or more: --scope=drive:${drives.slice(0, 2).map((d) => d.drive[0]).join(',')}`);
   if (top) lines.push(`  --scope=project       only this project: ${resolve(top)} (its worktrees and agent leftovers)`);
-  lines.push('', 'Then run: npx -y codein-tidy@latest --scope=<their choice>');
+  lines.push('', `Then run: ${TOOL} --scope=<their choice>`);
   return lines.join('\n');
 }
 
@@ -1863,10 +1868,10 @@ export function formatForAgent(plan) {
   let step = 1;
   if (waiting.length) {
     lines.push(`${step++}. First the folders that are not ready. Tell the person they hold uncommitted work, then do this:`, '',
-      ...agentBrief(plan, { rerun: `npx -y codein-tidy@latest ${flag}  (committed folders move to "Ready to free")` }).split('\n').map((l) => `   ${l}`), '');
+      ...agentBrief(plan, { rerun: `${TOOL} ${flag}  (committed folders move to "Ready to free")` }).split('\n').map((l) => `   ${l}`), '');
   }
   lines.push(`${step++}. Show the list to the person and ask which items to free ([x] are suggested; history is deleted for good).`,
-    `${step++}. Run their choice: npx -y codein-tidy@latest ${flag} --apply=<names, comma separated> (or --apply=suggested, or --apply=all).`,
+    `${step++}. Run their choice: ${TOOL} ${flag} --apply=<names, comma separated> (or --apply=suggested, or --apply=all).`,
     '   Never run --apply without the person\'s answer.',
     '   Before a worktree is removed, everything only it holds is saved into one file per project: its work, its commits that',
     '   exist nowhere else, local files git ignores, and agent context and scratch files. codein-tidy restore <id> puts one back.');
@@ -2341,7 +2346,8 @@ async function guidedLines({ input, output, options }) {
 }
 
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
-export async function main(argv) {
+export async function main(argv, host = {}) {
+  if (host.command) TOOL = host.command;
   const args = new Set(argv.filter((a) => a.startsWith('--')));
   const command = argv.find((a) => !a.startsWith('--')) ?? 'report';
   const older = argv.find((a) => a.startsWith('--older-than='));
