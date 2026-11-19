@@ -1425,3 +1425,88 @@ test('guided for an agent: the bare command lists named items and how to apply; 
   assert.equal(await exists(join(m.home, '.claude', 'shell-snapshots', 'old.sh')), false);
   assert.equal(await exists(join(idle, 'half.js')), true, 'nothing that was not named');
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------------------------------------------
+import { analyzeMemory, splitBusy, memoryReport, stopLeftovers, formatMemory, formatMemoryNotice } from './tidy.mjs';
+import { spawn as spawnProcess } from 'node:child_process';
+
+const MB = 1048576, T0 = Date.parse('2026-11-19T08:00:00Z');
+const row = (pid, ppid, name, mbUsed, command = name, minutes = 0, cpu = 0) => ({ pid, ppid, name, bytes: mbUsed * MB, command, started: T0 + minutes * 60_000, cpu });
+
+test('memory groups each agent session with what it started, and finds idle leftovers whose parent is gone', () => {
+  const rows = [
+    row(10, 1, 'Code.exe', 300, 'Code.exe', 0),
+    row(11, 10, 'Code.exe', 200, 'Code.exe --type=renderer --vscode-window-config=x', 0),
+    row(20, 10, 'claude.exe', 400, 'claude.exe --output-format stream-json', 1),
+    row(21, 20, 'node.exe', 60, 'node npx-cli.js -y @playwright/mcp@latest', 2),
+    row(22, 20, 'bash.exe', 10, 'bash -c npm run dev', 2),
+    row(23, 22, 'node.exe', 150, 'node next dev', 2),
+    row(30, 10, 'claude.exe', 300, 'claude.exe --output-format stream-json', 3),
+    row(31, 30, 'node.exe', 61, 'node npx-cli.js -y @playwright/mcp@latest', 4),
+    row(40, 10, 'codex.exe', 30, 'codex.exe app-server', 1),
+    row(41, 40, 'codex.exe', 20, 'codex.exe exec', 1),
+    // Leftovers: a dev server whose shell is gone, and a shell holding a python server whose parent is a reused id.
+    row(50, 999, 'node.exe', 220, 'node vite --port 5173', 5),
+    row(60, 70, 'powershell.exe', 60, 'powershell -Command python -m http.server', 6),
+    row(61, 60, 'python.exe', 20, 'python -m http.server 8799', 6),
+    row(70, 1, 'explorer.exe', 100, 'explorer.exe', 30), // started after 60: not its parent
+    // Not leftovers: a tray app, a Gradle daemon, and an orphaned agent (it is a session, not a leftover).
+    row(80, 998, 'RadeonSoftware.exe', 25, 'RadeonSoftware.exe', 1),
+    row(81, 997, 'java.exe', 500, 'java -cp gradle.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.5', 1),
+    row(90, 996, 'claude.exe', 250, 'claude.exe', 7),
+  ];
+  const r = analyzeMemory(rows, { self: 123456 });
+  assert.deepEqual(r.sessions.map((s) => [s.kind, s.pid]).sort(), [['Claude Code', 20], ['Claude Code', 30], ['Claude Code', 90], ['Codex', 40]].sort());
+  const first = r.sessions.find((s) => s.pid === 20);
+  assert.equal(first.bytes, (400 + 60 + 10 + 150) * MB, 'a session counts what it started');
+  assert.equal(r.sessions.find((s) => s.pid === 40).processes, 2, 'a codex under codex is one session');
+  assert.deepEqual(r.leftovers.map((l) => l.key).sort(), ['p50', 'p60']);
+  assert.equal(r.leftovers.find((l) => l.key === 'p60').bytes, 80 * MB, 'the whole tree goes with a leftover');
+  assert.equal(r.duplicates.length, 1);
+  assert.equal(r.duplicates[0].count, 2);
+  assert.equal(r.editors[0].label, 'VS Code');
+  assert.equal(r.editors[0].windows, 1);
+  const text = formatMemory({ ...r, working: [] });
+  assert.match(text, /Agent sessions: 4/);
+  assert.match(text, /Running once per session:/);
+  assert.match(text, /p50 {2}220 MB {2}node vite --port 5173/);
+});
+
+test('a leftover that is busy or new is listed as still working and never offered', () => {
+  const rows = [row(50, 999, 'node.exe', 220, 'node vite', 0, 1000), row(60, 998, 'node.exe', 300, 'node npm-cli.js ci', 0, 5000), row(70, 997, 'node.exe', 40, 'node server.js', 55, 10)];
+  const r = analyzeMemory(rows, { self: 1 });
+  const later = [row(50, 999, 'node.exe', 220, 'node vite', 0, 1010), row(60, 998, 'node.exe', 300, 'node npm-cli.js ci', 0, 9000), row(70, 997, 'node.exe', 40, 'node server.js', 55, 10)];
+  const split = splitBusy(r, later, { now: T0 + 60 * 60_000 });
+  assert.deepEqual(split.leftovers.map((l) => l.key), ['p50']);
+  assert.deepEqual(split.working.map((w) => [w.key, w.reason]).sort(), [['p60', 'using the processor now'], ['p70', 'started in the last 10 minutes']]);
+  assert.equal(formatMemoryNotice(split, 300 * MB), '', 'under the line: no session notice');
+  assert.match(formatMemoryNotice(split), /1 leftover process\(es\) from ended sessions use 220 MB/);
+});
+
+test('ram finds a real idle orphan server, refuses one whose process changed, and stops it', { timeout: 60_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'tidy-ram-'));
+  const server = join(root, 'server.mjs'), pidFile = join(root, 'pid');
+  await writeFile(server, `import http from 'node:http';import {writeFileSync} from 'node:fs';http.createServer((q,s)=>s.end('ok')).listen(0,'127.0.0.1',()=>writeFileSync(${JSON.stringify(pidFile)},String(process.pid)));`);
+  // A launcher starts the server detached and exits at once: the server's parent is gone, like an ended session's.
+  const launcher = spawnProcess(process.execPath, ['-e', `const c=require('child_process').spawn(process.execPath,[${JSON.stringify(server)}],{detached:true,stdio:'ignore',windowsHide:true});c.unref();`], { stdio: 'ignore', windowsHide: true });
+  await new Promise((done) => launcher.once('exit', done));
+  let pid;
+  for (let i = 0; i < 100 && !pid; i++) { pid = Number(await import('node:fs/promises').then((f) => f.readFile(pidFile, 'utf8')).catch(() => '')) || undefined; if (!pid) await new Promise((d) => setTimeout(d, 100)); }
+  const alive = (p) => { try { process.kill(p, 0); return true; } catch { return false; } };
+  try {
+    assert.ok(pid && alive(pid), 'the orphan server is running');
+    const r = await memoryReport({ sampleMs: 300, recentMs: 0 });
+    const mine = r.leftovers.find((l) => l.pid === pid);
+    assert.ok(mine, `the orphan is offered as a leftover: ${JSON.stringify(r.leftovers.map((l) => l.key))}`);
+    const changed = await stopLeftovers([{ ...mine, command: mine.command + ' changed', processes: mine.processes.map((q) => ({ ...q, command: q.command + ' changed' })) }]);
+    assert.equal(changed[0].status, 'already gone', 'a process that no longer matches is never stopped');
+    assert.ok(alive(pid));
+    const stopped = await stopLeftovers([mine]);
+    assert.equal(stopped[0].status, 'stopped');
+    assert.ok(stopped[0].freed > 0);
+    for (let i = 0; i < 50 && alive(pid); i++) await new Promise((d) => setTimeout(d, 100));
+    assert.equal(alive(pid), false, 'the server process ended');
+  } finally { if (pid && alive(pid)) try { process.kill(pid); } catch {} }
+});

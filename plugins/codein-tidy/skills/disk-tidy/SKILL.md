@@ -117,6 +117,20 @@ commits so the worktree becomes safe to remove:
 7. Tell the user which worktrees you committed, on which branch, and in one line what each held.
 8. Run the clean again; those worktrees are now safe to remove, and their branches stay in the repository.
 
+## Memory (RAM)
+
+Use this when a session starts with a codein-tidy memory notice, or the user says the computer is slow, RAM is full,
+or asks what is using memory.
+
+1. Run `npx -y codein-tidy@latest ram`. It reads only. It shows memory by agent session (what each one started),
+   the editors, helpers running once per session, and leftovers: idle developer processes (dev servers, headless
+   browsers, watchers) whose parent program is gone. A process still using the processor, or started in the last
+   10 minutes, is listed as still working and is never offered.
+2. Show the user the leftovers with their size and command, and ask which to stop.
+3. Stop only what they pick: `npx -y codein-tidy@latest ram --stop=p1234,p5678` (or `--stop=all`). Each one is
+   re-checked first; one that changed is not stopped. Tell the user what was stopped and how much memory was freed.
+4. Never stop an agent, an editor or anything outside the leftover list by hand.
+
 ## Rules
 
 - By default it removes only rebuildable data past an age limit (caches, snapshots, logs, recordings).

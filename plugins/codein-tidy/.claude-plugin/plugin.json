@@ -1,6 +1,6 @@
 {
   "name": "codein-tidy",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Shows unfinished work at the start of every session and safely frees the disk space AI coding tools leave behind. Uncommitted work is never deleted.",
   "author": {
     "name": "code.in",

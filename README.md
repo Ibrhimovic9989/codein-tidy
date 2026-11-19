@@ -23,6 +23,18 @@ The one command is the whole job, in a terminal with the arrow keys or through y
    screen names the file each project's work is saved into.
 6. **Save, then free**, with a live bar.
 
+### Memory
+
+```
+npx codein-tidy ram        # memory by agent session, and idle leftovers you can stop
+```
+
+Coding agents start dev servers, headless browsers and watchers, and some keep running after the session that
+started them has ended. `ram` shows memory per agent session (and what each one started), your editors, helpers
+that run once per session, and leftovers: idle developer processes whose parent program is gone. It never offers a
+process that is still using the processor or started in the last 10 minutes, and it re-checks each one right
+before stopping it. The session-start notice mentions leftovers when they hold 200 MB or more.
+
 Through an agent (no terminal) the same steps are printed as text: the scope question first
 (`--scope=computer`, `--scope=drive:C,D`, `--scope=project`), then the list with a name per item and the task
 for the folders that are not ready. The agent runs your choice with `npx codein-tidy --scope=... --apply=<names>`.
@@ -196,6 +208,7 @@ is on its way).
 | `review` | Lists worktrees holding uncommitted work, split into real work and agent leftovers. |
 | `prepare --project=PATH` | Moves a worktree's agent leftovers to trash and ignores agent state locally. Add `--yes`. |
 | `record --project=PATH --summary="..." [--relevant=files\|none\|all]` | An agent's review of a folder, stored with its work when the folder is saved. It also hands the folder back: the commit the agent just made no longer counts as the folder being in use. |
+| `ram` | Reads only. Memory by agent session, the editors, helpers running once per session, and idle leftovers whose parent program is gone. In a terminal it asks before stopping them; an agent asks the user, then runs `ram --stop=KEY,KEY` or `--stop=all`. A process that is still working is never offered, and each one is re-checked before it is stopped. |
 | `save`, `saved`, `restore`, `close`, `slot`, `deps`, `guard`, `rules` | See "Keep projects lean" above. |
 
 ## Why

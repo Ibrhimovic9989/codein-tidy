@@ -2596,6 +2596,218 @@ async function guidedLines({ input, output, options }) {
 }
 
 /** Run the command line. Exported so a host CLI (code.in's `codein tidy`) can call it. */
+// ---------------------------------------------------------------------------------------------------------------
+// Memory. Coding agents start dev servers, browsers, watchers and language servers, and some outlive the session that
+// started them. `ram` shows memory by agent session, the leftovers whose parent is gone, and the same server running
+// once per session. It stops only what the person picks, and re-checks each process (same start time, same command)
+// right before stopping it, so a reused process id is never hit.
+// ---------------------------------------------------------------------------------------------------------------
+function run(file, args, { timeout = 30_000 } = {}) {
+  return new Promise((done, fail) => execFile(file, args, { windowsHide: true, maxBuffer: 64 * 1024 * 1024, timeout },
+    (error, stdout) => (error ? fail(error) : done(stdout))));
+}
+
+function elapsedMs(text) { // ps etime: [[dd-]hh:]mm:ss
+  const [days, rest] = text.includes('-') ? text.split('-') : ['0', text];
+  const parts = rest.split(':').map(Number);
+  while (parts.length < 3) parts.unshift(0);
+  return (((Number(days) * 24 + parts[0]) * 60 + parts[1]) * 60 + parts[2]) * 1000;
+}
+
+export async function processSnapshot({ os = platform() } = {}) {
+  if (os === 'win32') {
+    const script = "Get-CimInstance Win32_Process | ForEach-Object { [pscustomobject]@{ pid=[int]$_.ProcessId; ppid=[int]$_.ParentProcessId; name=$_.Name; bytes=[int64]$_.WorkingSetSize; cpu=[int64](($_.UserModeTime + $_.KernelModeTime) / 10000); started=$(if ($_.CreationDate) { $_.CreationDate.ToUniversalTime().ToString('o') } else { $null }); command=$_.CommandLine } } | ConvertTo-Json -Compress";
+    const rows = JSON.parse((await run('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script])) || '[]');
+    return (Array.isArray(rows) ? rows : [rows]).map((r) => ({ pid: r.pid, ppid: r.ppid, name: r.name ?? '', bytes: Number(r.bytes) || 0, cpu: Number(r.cpu) || 0,
+      started: r.started ? Date.parse(r.started) : null, command: r.command ?? '' }));
+  }
+  const now = Date.now();
+  return (await run('ps', ['-axww', '-o', 'pid=,ppid=,rss=,etime=,time=,command='])).split('\n')
+    .map((line) => line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(.*)$/)).filter(Boolean)
+    .map((m) => ({ pid: Number(m[1]), ppid: Number(m[2]), bytes: Number(m[3]) * 1024, started: now - elapsedMs(m[4]),
+      cpu: elapsedMs(m[5].replace(/\.\d+$/, '')), command: m[6], name: basename(m[6].split(/\s+/)[0]) }));
+}
+
+// The agent processes a session lives in. A process of the same kind under another is part of that one session.
+const AGENT_KINDS = [
+  ['Claude Code', (p) => /^claude(\.exe)?$/i.test(p.name) || /@anthropic-ai[\\/]claude-code/i.test(p.command)],
+  ['Codex', (p) => /^codex(\.exe)?$/i.test(p.name) || /@openai[\\/]codex/i.test(p.command)],
+  ['code.in', (p) => /\bharness-service\b/.test(p.command) && /code-in|codein|@code\.in/i.test(p.command)],
+  ['Cursor agent', (p) => /cursor-agent/i.test(p.command)],
+  ['Gemini CLI', (p) => /@google[\\/]gemini-cli/i.test(p.command)],
+  ['OpenCode', (p) => /^opencode(\.exe)?$/i.test(p.name)],
+  ['Aider', (p) => /^python/i.test(p.name) && /[\\/ ]aider(\.exe)?(\s|$)/i.test(p.command)],
+];
+const EDITORS = [['VS Code', /^code(\.exe)?$/i], ['Cursor', /^cursor(\.exe)?$/i], ['Windsurf', /^windsurf(\.exe)?$/i], ['Antigravity', /^antigravity(\.exe)?$/i]];
+// Developer processes a session starts. Only these are ever offered as leftovers; a desktop app whose launcher is
+// gone (a tray icon, a driver helper) is not an agent's leftover.
+const DEV_NAMES = /^(node|bun|deno|python[\d.]*w?|ruby|php|java|dotnet|esbuild|go|uvicorn|gunicorn|chrome-headless-shell|supervisor)(\.exe)?$/i;
+const SHELL_NAMES = /^(powershell|pwsh|cmd|bash|sh|zsh|conhost)(\.exe)?$/i;
+const KEPT_BY_DESIGN = /GradleDaemon|kotlin-daemon|\bsccache\b|\bwatchman\b|com\.docker|ollama/i;
+const headlessBrowser = (p) => /^(chrome|chromium|msedge)(\.exe)?$/i.test(p.name) && /--headless|ms-playwright|puppeteer/i.test(p.command);
+
+function kindOf(p) { for (const [kind, test] of AGENT_KINDS) if (test(p)) return kind; return null; }
+
+export function shortCommand(command, width = 90) {
+  const text = String(command || '').replace(/\s+/g, ' ').replace(/"([^"]*[\\/])([^"\\/]+)"/g, '$2').replace(/(^|\s)\S*[\\/]([^\\/\s]+)(?=\s|$)/g, '$1$2').trim();
+  return text.length > width ? `${text.slice(0, width - 1)}…` : text;
+}
+
+/** Group a process snapshot into agent sessions, editors, leftovers and duplicates. Pure: the tests feed it rows. */
+export function analyzeMemory(rows, { self = process.pid } = {}) {
+  const byPid = new Map(rows.map((p) => [p.pid, p]));
+  const children = new Map();
+  const parentOf = (p) => {
+    const parent = byPid.get(p.ppid);
+    // A parent that started after the child is a reused id: the real parent is gone.
+    return parent && parent.pid !== p.pid && !(parent.started && p.started && parent.started > p.started + 1000) ? parent : null;
+  };
+  for (const p of rows) { const parent = parentOf(p); if (parent) (children.get(parent.pid) ?? children.set(parent.pid, []).get(parent.pid)).push(p); }
+  const subtree = (root) => { const out = []; const stack = [root]; const seen = new Set(); while (stack.length) { const p = stack.pop(); if (seen.has(p.pid)) continue; seen.add(p.pid); out.push(p); stack.push(...(children.get(p.pid) ?? [])); } return out; };
+  const selfChain = new Set(); for (let p = byPid.get(self); p && !selfChain.has(p.pid); p = parentOf(p)) selfChain.add(p.pid);
+
+  // Sessions: the top-most agent process of each kind; everything under it (but not under another session) is its own.
+  const sessions = [];
+  for (const p of rows) {
+    const kind = kindOf(p); if (!kind) continue;
+    let top = true; for (let a = parentOf(p); a; a = parentOf(a)) if (kindOf(a) === kind) { top = false; break; }
+    if (top) sessions.push({ kind, root: p });
+  }
+  const sessionPids = new Set(sessions.map((s) => s.root.pid));
+  for (const s of sessions) {
+    const own = []; const stack = [s.root]; while (stack.length) { const p = stack.pop(); own.push(p); for (const c of children.get(p.pid) ?? []) if (!sessionPids.has(c.pid)) stack.push(c); }
+    const groups = new Map();
+    for (const p of own.slice(1)) { const label = p.name.replace(/\.exe$/i, ''); const g = groups.get(label) ?? { label, count: 0, bytes: 0 }; g.count += 1; g.bytes += p.bytes; groups.set(label, g); }
+    Object.assign(s, { pid: s.root.pid, started: s.root.started, selfBytes: s.root.bytes, bytes: own.reduce((n, p) => n + p.bytes, 0), processes: own.length,
+      parts: [...groups.values()].sort((a, b) => b.bytes - a.bytes), members: own });
+  }
+  sessions.sort((a, b) => b.bytes - a.bytes);
+
+  const editors = [];
+  for (const [label, re] of EDITORS) {
+    const all = rows.filter((p) => re.test(p.name));
+    if (all.length) editors.push({ label, processes: all.length, bytes: all.reduce((n, p) => n + p.bytes, 0), windows: all.filter((p) => /--type=renderer/.test(p.command) && /--vscode-window-config/.test(p.command)).length });
+  }
+
+  // Leftovers: a developer process (or a shell holding one) whose parent is gone. Its whole tree goes with it.
+  const leftovers = [];
+  const claimed = new Set();
+  for (const p of rows) {
+    if (claimed.has(p.pid) || selfChain.has(p.pid) || p.pid <= 4 || parentOf(p)) continue;
+    const tree = subtree(p);
+    const dev = tree.filter((q) => (DEV_NAMES.test(q.name) || headlessBrowser(q)) && !KEPT_BY_DESIGN.test(q.command));
+    if (!dev.length || !(DEV_NAMES.test(p.name) || SHELL_NAMES.test(p.name) || headlessBrowser(p))) continue;
+    if (tree.some((q) => kindOf(q) || selfChain.has(q.pid) || EDITORS.some(([, re]) => re.test(q.name)))) continue; // a live agent or editor is never a leftover
+    if (KEPT_BY_DESIGN.test(p.command)) continue;
+    tree.forEach((q) => claimed.add(q.pid));
+    const main = dev.sort((a, b) => b.bytes - a.bytes)[0];
+    leftovers.push({ key: `p${p.pid}`, pid: p.pid, started: p.started, command: p.command, label: shortCommand(main.command || main.name),
+      bytes: tree.reduce((n, q) => n + q.bytes, 0), processes: tree.map((q) => ({ pid: q.pid, started: q.started, command: q.command, name: q.name, cpu: q.cpu ?? 0 })) });
+  }
+  leftovers.sort((a, b) => b.bytes - a.bytes);
+
+  // Duplicates: the same helper (an MCP server, a language server) running once per session.
+  const normalize = (c) => shortCommand(c, 400).replace(/\b\d{4,}\b/g, '#').replace(/--(?:port|user-data-dir|clientProcessId)[= ]\S+/g, '').trim();
+  const dupes = new Map();
+  for (const s of sessions) for (const p of s.members.slice(1)) {
+    if (!/mcp|language-?server|tsserver|lsp/i.test(p.command)) continue;
+    const key = normalize(p.command); const d = dupes.get(key) ?? { label: shortCommand(p.command, 80), sessions: new Set(), count: 0, bytes: 0 };
+    d.sessions.add(s.pid); d.count += 1; d.bytes += p.bytes; dupes.set(key, d);
+  }
+  const duplicates = [...dupes.values()].filter((d) => d.sessions.size > 1).map((d) => ({ label: d.label, count: d.count, sessions: d.sessions.size, bytes: d.bytes })).sort((a, b) => b.bytes - a.bytes);
+
+  return { total: rows.reduce((n, p) => n + p.bytes, 0), sessions: sessions.map(({ members, root, ...s }) => s), editors, leftovers, duplicates };
+}
+
+/** A process without its parent may still be doing work (an install, a build). Only an idle one, past its first
+ * minutes, is a leftover to offer; a busy or new one is listed as still working and never offered. */
+export function splitBusy(report, later, { now = Date.now(), recentMs = 10 * 60_000, busyCpuMs = 50 } = {}) {
+  const cpuNow = new Map(later.map((p) => [p.pid, p]));
+  const idle = [], working = [];
+  for (const l of report.leftovers) {
+    const delta = l.processes.reduce((n, q) => { const after = cpuNow.get(q.pid); return n + (after && after.command === q.command ? Math.max(0, (after.cpu ?? 0) - (q.cpu ?? 0)) : 0); }, 0);
+    const recent = Boolean(l.started) && now - l.started < recentMs;
+    if (delta > busyCpuMs || recent) working.push({ ...l, reason: delta > busyCpuMs ? 'using the processor now' : 'started in the last 10 minutes' });
+    else idle.push(l);
+  }
+  return { ...report, leftovers: idle, working };
+}
+
+export async function memoryReport(options = {}) {
+  const snapshot = options.snapshot ?? processSnapshot;
+  const report = analyzeMemory(await snapshot(), options);
+  if (!report.leftovers.length) return { ...report, working: [] };
+  await new Promise((done) => setTimeout(done, options.sampleMs ?? 1500));
+  return splitBusy(report, await snapshot(), options);
+}
+
+const mb = (bytes) => `${Math.round(bytes / 1048576).toLocaleString('en-US')} MB`;
+const clock = (ms) => (ms ? new Date(ms).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : 'unknown time');
+
+export function formatMemory(r) {
+  const lines = [];
+  lines.push(`Agent sessions: ${r.sessions.length}${r.sessions.length ? `, ${mb(r.sessions.reduce((n, s) => n + s.bytes, 0))} in all` : ''}`);
+  for (const s of r.sessions) {
+    lines.push(`  ${s.kind} (process ${s.pid}, started ${clock(s.started)}): ${mb(s.bytes)}`);
+    const parts = s.parts.filter((g) => g.bytes >= 20 * 1048576).slice(0, 4);
+    if (parts.length) lines.push(`    ${parts.map((g) => `${g.label}${g.count > 1 ? ` x${g.count}` : ''} ${mb(g.bytes)}`).join(', ')}`);
+  }
+  for (const e of r.editors) lines.push(`${e.label}: ${mb(e.bytes)} across ${e.processes} processes${e.windows ? ` (${e.windows} window${e.windows > 1 ? 's' : ''})` : ''}`);
+  if (r.duplicates.length) {
+    lines.push('', 'Running once per session:');
+    for (const d of r.duplicates.slice(0, 6)) lines.push(`  ${d.label}: ${d.count} copies in ${d.sessions} sessions, ${mb(d.bytes)}`);
+  }
+  lines.push('');
+  if (r.working?.length) {
+    lines.push(`Running without the program that started it, but still working (not offered): ${r.working.length}`);
+    for (const w of r.working) lines.push(`  ${mb(w.bytes)}  ${w.label}  (${w.reason})`);
+    lines.push('');
+  }
+  if (!r.leftovers.length) lines.push('Leftovers: none. No idle developer process is running without the program that started it.');
+  else {
+    lines.push(`Leftovers: ${r.leftovers.length}, ${mb(r.leftovers.reduce((n, l) => n + l.bytes, 0))}. The program that started them is gone and they are idle:`);
+    for (const l of r.leftovers) lines.push(`  ${l.key}  ${mb(l.bytes)}  ${l.label}  (started ${clock(l.started)}${l.processes.length > 1 ? `, ${l.processes.length} processes` : ''})`);
+  }
+  return lines.join('\n');
+}
+
+function treeKill(pids, os = platform()) {
+  return Promise.all(pids.map((pid) => (os === 'win32'
+    ? run('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 15_000 }).catch(() => undefined)
+    : Promise.resolve().then(() => { try { process.kill(pid, 'SIGTERM'); } catch {} }))));
+}
+
+/** Stop chosen leftovers. Each one is re-read first and skipped if its process changed (ended, or the id was reused). */
+export async function stopLeftovers(leftovers, options = {}) {
+  const snapshot = options.snapshot ?? processSnapshot;
+  const os = options.os ?? platform();
+  const before = new Map((await snapshot()).map((p) => [p.pid, p]));
+  const same = (want, got) => got && got.command === want.command && (!want.started || !got.started || Math.abs(got.started - want.started) < 2000);
+  const results = [];
+  for (const l of leftovers) {
+    const live = l.processes.filter((q) => same(q, before.get(q.pid)));
+    if (!live.length) { results.push({ key: l.key, status: 'already gone', freed: 0 }); continue; }
+    if (!same(l, before.get(l.pid)) && live.length < l.processes.length) { results.push({ key: l.key, status: 'changed since the report; not stopped', freed: 0 }); continue; }
+    await treeKill(live.map((q) => q.pid), os);
+    let after = new Map((await snapshot()).map((p) => [p.pid, p]));
+    if (os !== 'win32' && live.some((q) => same(q, after.get(q.pid)))) {
+      await new Promise((done) => setTimeout(done, 2000));
+      for (const q of live) if (same(q, after.get(q.pid))) { try { process.kill(q.pid, 'SIGKILL'); } catch {} }
+      after = new Map((await snapshot()).map((p) => [p.pid, p]));
+    }
+    const still = live.filter((q) => same(q, after.get(q.pid)));
+    const freed = live.filter((q) => !still.includes(q)).reduce((n, q) => n + (before.get(q.pid)?.bytes ?? 0), 0);
+    results.push({ key: l.key, status: still.length ? `${still.length} process(es) did not stop` : 'stopped', freed });
+  }
+  return results;
+}
+
+export function formatMemoryNotice(r, min = 200 * 1048576) {
+  const bytes = r.leftovers.reduce((n, l) => n + l.bytes, 0);
+  if (bytes < min) return '';
+  return `codein-tidy: ${r.leftovers.length} leftover process(es) from ended sessions use ${mb(bytes)} of memory (${r.leftovers.slice(0, 3).map((l) => l.label).join('; ')}). Show them and stop the ones the user picks: ${TOOL} ram`;
+}
+
 export async function main(argv, host = {}) {
   if (host.command) TOOL = host.command;
   const args = new Set(argv.filter((a) => a.startsWith('--')));
@@ -2637,7 +2849,40 @@ export async function main(argv, host = {}) {
     if (args.has('--json')) console.log(JSON.stringify(receipt));
     return;
   }
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'hook', 'rules', 'deps', 'guard', 'record', 'check', 'repair'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'hook', 'rules', 'deps', 'guard', 'record', 'check', 'repair', 'ram'];
+  if (command === 'ram') {
+    let report;
+    try { report = await memoryReport(); } catch (error) { console.error(`Could not read the process list: ${String(error.message ?? error)}`); process.exitCode = 1; return; }
+    const stop = value('stop');
+    let chosen;
+    if (stop === undefined) {
+      if (args.has('--json')) { console.log(JSON.stringify(report, null, 2)); return; }
+      console.log(formatMemory(report));
+      if (!report.leftovers.length) return;
+      if (!(process.stdin.isTTY && process.stdout.isTTY)) {
+        console.log(`\nAsk the user which to stop; nothing is stopped without that choice.\n  Stop all: ${TOOL} ram --stop=all\n  Stop some: ${TOOL} ram --stop=${report.leftovers.slice(0, 2).map((l) => l.key).join(',')}`);
+        return;
+      }
+      const { createInterface } = await import('node:readline/promises');
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      const answer = (await rl.question(`\nStop ${report.leftovers.length === 1 ? 'it' : `all ${report.leftovers.length}`}? [y/N] `)).trim().toLowerCase();
+      rl.close();
+      if (answer !== 'y' && answer !== 'yes') { console.log('Nothing stopped.'); return; }
+      chosen = report.leftovers;
+    } else {
+      const names = stop.split(',').map((n) => n.trim()).filter(Boolean);
+      chosen = names.includes('all') ? report.leftovers : report.leftovers.filter((l) => names.includes(l.key));
+      const unknown = names.filter((n) => n !== 'all' && !report.leftovers.some((l) => l.key === n));
+      if (unknown.length) console.log(`Not a leftover now (ended already, or still has its parent): ${unknown.join(', ')}.`);
+    }
+    if (!chosen.length) { console.log('Nothing to stop.'); return; }
+    const results = await stopLeftovers(chosen);
+    if (args.has('--json')) { console.log(JSON.stringify(results, null, 2)); return; }
+    for (const r of results) console.log(`  ${r.key}: ${r.status}${r.freed ? `, ${mb(r.freed)} freed` : ''}`);
+    console.log(`Freed ${mb(results.reduce((n, r) => n + r.freed, 0))} of memory.`);
+    if (results.some((r) => r.status !== 'stopped' && r.status !== 'already gone')) process.exitCode = 1;
+    return;
+  }
   if (command === 'check') {
     try {
       const r = await checkFolder(options.project ?? process.cwd());
@@ -2809,9 +3054,10 @@ export async function main(argv, host = {}) {
   if (command === 'work') {
     if (args.has('--notice')) {
       // Runs at the start of every agent session: never fail it, never slow it past the cap, print nothing when clean.
+      const capped = (work, ms) => Promise.race([work.catch(() => null), new Promise((done) => setTimeout(() => done(null), ms).unref())]);
+      const [projects, memory] = await Promise.all([capped(unfinishedWork(options), 20_000), capped(memoryReport(), 10_000)]);
       try {
-        const projects = await Promise.race([unfinishedWork(options), new Promise((done) => setTimeout(() => done(null), 20_000).unref())]);
-        const text = projects ? formatNotice(projects) : '';
+        const text = [projects ? formatNotice(projects) : '', memory ? formatMemoryNotice(memory) : ''].filter(Boolean).join('\n');
         if (text) console.log(text);
       } catch {}
       return;
