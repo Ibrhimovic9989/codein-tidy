@@ -28,8 +28,11 @@ One command does the whole job. The person decides; you do the work that needs j
 2. Read the list. "Ready to free" items free space now. "Not ready yet" are worktrees holding uncommitted work.
 
 3. If any folder is not ready, tell the person, then do the task printed under "To the agent": for each folder,
-   read the work, commit the real work as the git identity that folder already has (never change git config,
-   never pass --author, never push), and record what it was:
+   read the work and run `npx -y codein-tidy@latest check --project=<folder>`. It separates real work from
+   scratch (never commit scratch: it is kept in the save) and flags files that look like secrets (never commit
+   those; tell the person). Tracked files listed as missing from disk are not work: never commit their deletion.
+   Commit only the real work, `git add` by name, as the git identity that folder already has (never change git
+   config, never pass --author, never push), and record what it was:
 
    ```
    npx -y codein-tidy@latest record --project=<folder> --summary="<what this work was>" --relevant=<file,file|none|all>
@@ -82,8 +85,12 @@ When you see unfinished work:
   offer the user `close`.
 - To free idle worktrees, show the user the plan first: `npx -y codein-tidy@latest close`. It saves every
   folder's work (a snapshot commit plus ignored local files) into one file per project before git removes the
-  folder. Run it with `--yes` only after the user agrees. `codein-tidy saved` lists what was saved, and
-  `codein-tidy restore <id>` puts a folder back exactly.
+  folder. It never takes a folder holding uncommitted work: commit that first (below). Run it with `--yes` only
+  after the user agrees; `--only=<folder>,<folder>` takes exactly the folders the user picked.
+  `codein-tidy saved` lists what was saved, and `codein-tidy restore <id>` puts a folder back exactly.
+- A worktree a removal stopped halfway in (its `.git` link gone, thousands of files "deleted", a git lock left
+  behind) is shown as "broken link". `close` repairs it first; to repair only:
+  `npx -y codein-tidy@latest repair --project=<folder>` (plan), then with `--yes`. Work is never touched.
 - `npx -y codein-tidy@latest deps` shows whether this project's installs are shared or copied, and the fix.
 
 ## Worktrees with uncommitted work
@@ -97,10 +104,14 @@ commits so the worktree becomes safe to remove:
    leftovers to a trash folder (emptied after 7 days) and adds agent state folders to the repository's local
    ignore list. It never touches real work, and it prints what real work is left.
 3. Work inside the worktree folder. Read the real work: `git status`, `git diff`, and every new file.
-   Understand what it is before you commit it.
+   Understand what it is before you commit it. Then run `npx -y codein-tidy@latest check --project=<folder>`:
+   commit only what it lists as work, never scratch, never a file it marks as a secret, and never the deletion
+   of tracked files that are only missing from disk.
 4. If it has no branch (`"branch": null`), create one first: `git switch -c tidy/<short-name>`.
-5. Commit it with a message that says what the work is: `git add -A` then `git commit -m "..."`.
-   Do not push unless the user asks. If nothing real is left after step 2, there is nothing to commit.
+5. Commit it with a message that says what the work is: `git add <file> <file>` by name, then `git commit -m "..."`.
+   Never `git add -A`. Do not push unless the user asks. If nothing real is left after step 2, there is nothing to commit.
+   Then `npx -y codein-tidy@latest record --project=<folder> --summary="..."`, so the fresh commit does not keep
+   the folder as "in use".
 6. Never run `git reset`, `git checkout -- .`, `git stash`, `git clean`, or delete files to make a worktree clean.
    If something should not be committed (secrets, huge generated files), stop and ask the user.
 7. Tell the user which worktrees you committed, on which branch, and in one line what each held.

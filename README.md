@@ -99,7 +99,9 @@ commands keep a project's disk use tied to how many agents work on it at once, n
 | Command | What it does |
 |---|---|
 | `save --project=PATH [--yes]` | Saves a folder exactly, into one bundle file: a snapshot commit of its work (built without touching your branch, index or hooks) and a second commit with ignored local files, agent context and scratch. `saved` lists saves; `restore ID` puts one back. |
-| `close [--all] [--idle-days=N] [--yes]` | For every idle worktree (default: untouched for a day): everything only that folder holds is saved into one file per project, then git removes the folder. Never the main checkout, the folder you are in, or a locked worktree. |
+| `close [--all] [--idle-days=N] [--only=PATH,PATH] [--yes]` | For every idle worktree (default: untouched for a day): everything only that folder holds is saved into one file per project, then git removes the folder. Never the main checkout, the folder you are in, a locked worktree, or one holding uncommitted work (commit it first, or add `--include-uncommitted` to close it knowingly with its save as the only copy). A worktree a removal left half done is repaired first (see `repair`). `--only` takes exactly the folders named. |
+| `repair --project=PATH [--yes]` | A worktree a removal stopped halfway in: restores its `.git` link (`git worktree repair`), removes an empty git lock older than 10 minutes when no git process runs, and puts back deleted `.gitignore` files from its own commit. Work is never touched. |
+| `check --project=PATH` | Before an agent commits a folder's work: what is work, what is scratch (logs, captured streams, archives, probe scripts: never committed, kept in the save), which tracked files are only missing from disk, and which files look like secrets (exit code 3). |
 | `slot take --branch=X` / `slot release` / `slot list` | A small pool of working folders per project (budget 3, or `"budget"` in `.codein-tidy.json`), reused across tasks: installed dependencies stay, work left in a slot is saved first. |
 | `deps` | Proves which installs are shared with a store and which are private copies, with the cause and the fix (for example: npm has no shared store; pnpm's store is on another drive). |
 | `guard [--mode=notify\|close]`, `guard --install [--dry-run]` | A daily job (Task Scheduler, launchd or cron) that keeps every known project inside its budget. `notify` only reports; `close` saves and closes the oldest idle worktrees. |
@@ -193,7 +195,7 @@ is on its way).
 | `clean` | Shows the plan. Add `--yes` to carry it out. |
 | `review` | Lists worktrees holding uncommitted work, split into real work and agent leftovers. |
 | `prepare --project=PATH` | Moves a worktree's agent leftovers to trash and ignores agent state locally. Add `--yes`. |
-| `record --project=PATH --summary="..." [--relevant=files\|none\|all]` | An agent's review of a folder, stored with its work when the folder is saved. |
+| `record --project=PATH --summary="..." [--relevant=files\|none\|all]` | An agent's review of a folder, stored with its work when the folder is saved. It also hands the folder back: the commit the agent just made no longer counts as the folder being in use. |
 | `save`, `saved`, `restore`, `close`, `slot`, `deps`, `guard`, `rules` | See "Keep projects lean" above. |
 
 ## Why

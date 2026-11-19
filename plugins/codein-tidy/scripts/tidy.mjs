@@ -319,11 +319,18 @@ export function madeBy(path, main = false) {
 }
 
 /** Sort `git status --untracked-files=normal` entries into real work and agent leftovers. Fast: no file walk. */
+/**
+ * Sort `git status -z` lines. A tracked file missing from disk (" D", not staged) is not unsaved work: its content
+ * is in the commit. Whole folders of them are what a removal that stopped halfway leaves (2026-11-19: 244, 1,363
+ * and 8,793 in three worktrees). They are counted apart, recorded by a save, and never handed to an agent to commit.
+ */
 function sortStatus(raw) {
-  const out = { work: [], leftovers: 0 };
+  const out = { work: [], leftovers: 0, missing: 0 };
   for (const line of raw.split(String.fromCharCode(0)).filter((l) => /^[ MADRCU?!]{2} /.test(l))) {
     const code = line.slice(0, 2), rel = line.slice(3);
-    if (code === '??' && (PROJECT_JUNK.some((rule) => rule.test(rel)) || AGENT_STATE_DIRS.includes(rel.split('/')[0]))) out.leftovers += 1;
+    if (code === ' D') out.missing += 1;
+    // Agent state at any depth (apps/web/.code-ae/state/...), untracked: never work.
+    else if (code === '??' && (PROJECT_JUNK.some((rule) => rule.test(rel)) || rel.split('/').some((part) => AGENT_STATE_DIRS.includes(part)))) out.leftovers += 1;
     else out.work.push(line);
   }
   return out;
@@ -354,16 +361,22 @@ export async function unfinishedWork(options = {}) {
     if (!main) continue;
     const release = await releaseBranch(main);
     const hasRemote = Boolean((await gitAsync(['remote'], main))?.trim());
-    const rows = await pool(folders.filter((f) => !f.missing), 8, async (f) => {
+    // git calls a worktree "prunable" when its folder is gone, and also when only its .git link file is gone (a
+    // removal that stopped halfway). The second still holds files: it is kept, as "broken link", for repair.
+    const present = [];
+    for (const f of folders) if (!f.missing || await lstat(f.path)) present.push(f);
+    const rows = await pool(present, 8, async (f) => {
+      if (f.missing) return { ...f, missing: false, madeBy: madeBy(f.path, f.main), stage: 'broken link', changed: 0, leftovers: 0, missingFiles: 0, unpushed: 0,
+        touched: await newest(f.path, 1), idleDays: Math.max(0, Math.floor(((options.now ?? Date.now()) - await newest(f.path, 1)) / DAY)), lastCommit: '' };
       const raw = await gitAsync(['status', '--porcelain=v1', '-z', '--untracked-files=normal'], f.path);
-      if (raw === null) return { ...f, madeBy: madeBy(f.path, f.main), stage: 'unreadable', changed: 0, leftovers: 0, unpushed: 0 };
-      const { work, leftovers } = sortStatus(raw);
+      if (raw === null) return { ...f, madeBy: madeBy(f.path, f.main), stage: 'unreadable', changed: 0, leftovers: 0, missingFiles: 0, unpushed: 0 };
+      const { work, leftovers, missing: missingFiles } = sortStatus(raw);
       const unpushed = hasRemote ? Number((await gitAsync(['rev-list', '--count', 'HEAD', '--not', '--remotes'], f.path)) ?? 0) : null;
       const merged = release ? (await gitAsync(['merge-base', '--is-ancestor', 'HEAD', release], f.path)) !== null : null;
       const [when = '0', subject = ''] = ((await gitAsync(['log', '-1', '--format=%ct%x09%s'], f.path)) ?? '').trim().split('\t');
       const touched = Math.max(Number(when) * 1000, await newest(f.path, 1));
       const stage = work.length ? 'uncommitted' : !hasRemote ? 'no remote' : unpushed > 0 ? 'not pushed' : merged === false ? 'not merged' : merged ? 'in release' : 'pushed';
-      return { ...f, madeBy: madeBy(f.path, f.main), stage, changed: work.length, sample: work.slice(0, 5), leftovers, unpushed: unpushed ?? 0,
+      return { ...f, madeBy: madeBy(f.path, f.main), stage, changed: work.length, sample: work.slice(0, 5), leftovers, missingFiles, unpushed: unpushed ?? 0,
         touched, idleDays: Math.max(0, Math.floor(((options.now ?? Date.now()) - touched) / DAY)), lastCommit: subject };
     });
     projects.push({ name: basename(main), main, release, hasRemote, live: 'not checked', budget: await projectBudget(main), folders: rows });
@@ -371,11 +384,13 @@ export async function unfinishedWork(options = {}) {
   return projects;
 }
 
-const STAGE_ORDER = ['uncommitted', 'not pushed', 'no remote', 'not merged', 'unreadable'];
+const STAGE_ORDER = ['uncommitted', 'not pushed', 'no remote', 'not merged', 'broken link', 'unreadable'];
 const STAGE_TITLE = { uncommitted: 'Uncommitted work', 'not pushed': 'Committed, not pushed (only on this machine)',
-  'no remote': 'Committed, the project has no remote', 'not merged': 'Pushed, not in the release branch', unreadable: 'Could not be read' };
-const what = (f) => f.stage === 'uncommitted' ? `${f.changed} changed file(s)${f.unpushed ? ` + ${f.unpushed} unpushed commit(s)` : ''}`
-  : f.stage === 'not pushed' ? `${f.unpushed} commit(s)` : f.stage === 'not merged' ? 'pushed' : f.stage;
+  'no remote': 'Committed, the project has no remote', 'not merged': 'Pushed, not in the release branch',
+  'broken link': 'Git link broken (a removal stopped halfway): codein-tidy repair --project=<folder>', unreadable: 'Could not be read' };
+const what = (f) => (f.stage === 'uncommitted' ? `${f.changed} changed file(s)${f.unpushed ? ` + ${f.unpushed} unpushed commit(s)` : ''}`
+  : f.stage === 'not pushed' ? `${f.unpushed} commit(s)` : f.stage === 'not merged' ? 'pushed' : f.stage)
+  + (f.missingFiles ? `; ${f.missingFiles} file(s) missing from disk, still in the commit` : '');
 
 export function formatWork(projects) {
   const lines = [];
@@ -574,6 +589,14 @@ const PROJECT_JUNK = [
   { why: 'Temporary folders', test: (rel) => /^(\.?tmp|\.[\w-]*-tmp)$/i.test(rel.split('/')[0]) && (rel.includes('/') || rel.endsWith('/')) },
   { why: 'Probe and diagnostic files', test: (rel) => !rel.includes('/') && /^\.(diag|debug|probe|candidate\d*)[-_.]/i.test(rel) },
   { why: 'Stray files from shell mistakes', test: (rel) => ['nul', '-', '$null'].includes(rel.toLowerCase()) },
+  // Release and probe scratch seen in one worktree (2026-11-19): 84 files such as .vm-submit-api-<sha>.sh,
+  // .vm-cloudbuild-api-<sha>.yaml, .understory-runtime-fix.sse, .live-project-api.ps1, codein-src.tar, *.log.
+  // Some hold tokens or request headers: they are kept in the save, never committed.
+  { why: 'Logs and captured streams', test: (rel) => /\.(log|sse)$|\.log\.(err|out)$/i.test(rel) },
+  { why: 'Archives at the top of the project', test: (rel) => !rel.includes('/') && /\.(tar|tgz|tar\.gz)$/i.test(rel) },
+  { why: 'Probe and release scripts at the top of the project', test: (rel) => !rel.includes('/')
+      && /^\.[a-z0-9]+-[\w.-]*\.(sh|ps1|cmd|bat|py|js|cjs|mjs|ts|json|ya?ml|txt|err|out|sse|log|gz|tar|tgz)$/i.test(rel)
+      && !/^\.(git|github|pre-commit|markdownlint|lint-staged|eslint|prettier|stylelint|babel|swc|size-limit|env)/i.test(rel) },
   { why: 'PowerShell cache written into the project', test: (rel) => rel.startsWith('Microsoft/Windows/PowerShell/') },
 ];
 
@@ -984,7 +1007,68 @@ export async function recordReview(path, { summary, relevant } = {}, options = {
   all[resolve(top)] = { summary: text.slice(0, 2000), relevant: list, at: new Date(options.now ?? Date.now()).toISOString() };
   await fs.mkdir(tidyHome(options), { recursive: true });
   await fs.writeFile(recordsFile(options), JSON.stringify(all, null, 2));
+  // The agent has reviewed this folder and committed its work: the commit it just made must not count as the
+  // folder being in use. (A folder that still holds uncommitted work stays protected by that, not by its age.)
+  const handoff = await readHandoff(options);
+  handoff[resolve(top)] = options.now ?? Date.now();
+  await writeHandoff(handoff, options).catch(() => {});
   return { path: resolve(top), ...all[resolve(top)] };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Secrets. Patterns are a proxy: a match is a warning for a person or an agent to look at, never a silent block.
+// ---------------------------------------------------------------------------------------------------------------
+const SECRET_PATTERNS = [
+  { what: 'private key', re: /-----BEGIN [A-Z ]*PRIVATE KEY-----/ },
+  { what: 'AWS access key', re: /\b(AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  { what: 'GitHub token', re: /\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{30,}\b|\bgithub_pat_[A-Za-z0-9_]{40,}\b/ },
+  { what: 'Slack token', re: /\bxox[abprs]-[A-Za-z0-9-]{10,}\b/ },
+  { what: 'API key (sk-)', re: /\bsk-(?:[A-Za-z0-9_-]{2,20}-)?[A-Za-z0-9_-]{24,}\b/ },
+  { what: 'Google API key', re: /\bAIza[0-9A-Za-z_-]{35}\b/ },
+  { what: 'npm token', re: /\bnpm_[A-Za-z0-9]{36}\b/ },
+  { what: 'bearer token', re: /\b[Bb]earer\s+[A-Za-z0-9._~+/-]{24,}=*/ },
+  { what: 'JSON web token', re: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/ },
+  { what: 'password or secret assignment', re: /\b(password|passwd|secret|api[_-]?key|access[_-]?token|auth[_-]?token)\b["']?\s*[:=]\s*["'][^"'\s]{12,}["']/i },
+];
+
+/** Every line that looks like a secret: { line, what } (the value itself is never returned). */
+export function findSecrets(text) {
+  const hits = [];
+  String(text).split(/\r?\n/).forEach((line, i) => { for (const p of SECRET_PATTERNS) if (p.re.test(line)) { hits.push({ line: i + 1, what: p.what }); break; } });
+  return hits;
+}
+
+/**
+ * Before an agent commits a folder's work: what is work (and whether any of it looks like a secret), what is
+ * scratch (never committed; kept in the save), and how many tracked files are only missing from disk.
+ */
+export async function checkFolder(path) {
+  const top = git(['rev-parse', '--show-toplevel'], path);
+  if (!top) throw new Error(`${path} is not inside a git worktree`);
+  const raw = gitStatus(['--porcelain=v1', '-z', '--untracked-files=all'], top) ?? '';
+  const sorted = sortStatus(raw);
+  const scratch = raw.split(String.fromCharCode(0)).filter((l) => l.startsWith('?? ') && (PROJECT_JUNK.some((r) => r.test(l.slice(3)))
+    || l.slice(3).split('/').some((part) => AGENT_STATE_DIRS.includes(part)))).map((l) => l.slice(3));
+  const work = [];
+  for (const line of sorted.work) {
+    const rel = line.slice(3).replace(/^.* -> /, ''), full = join(top, rel);
+    const stat = await lstat(full);
+    let secrets = [];
+    if (stat?.isFile() && stat.size <= 2 * 1024 * 1024) secrets = findSecrets(await fs.readFile(full, 'utf8').catch(() => ''));
+    work.push({ rel, code: line.slice(0, 2), secrets });
+  }
+  return { path: resolve(top), work, scratch, missing: sorted.missing };
+}
+
+export function formatCheck(r) {
+  const lines = [`${r.path}`];
+  const risky = r.work.filter((w) => w.secrets.length);
+  lines.push(`  Work to commit (${r.work.length}):`, ...r.work.slice(0, 40).map((w) => `    ${w.code} ${w.rel}${w.secrets.length ? `   LOOKS LIKE A SECRET: ${w.secrets.map((s) => `${s.what} on line ${s.line}`).join(', ')}` : ''}`));
+  if (r.work.length > 40) lines.push(`    and ${r.work.length - 40} more`);
+  if (r.scratch.length) lines.push(`  Scratch, never commit (kept in the save) (${r.scratch.length}): ${r.scratch.slice(0, 8).join(', ')}${r.scratch.length > 8 ? ', ...' : ''}`);
+  if (r.missing) lines.push(`  ${r.missing} tracked file(s) are missing from disk but still in the commit: not work, do not commit their deletion unless the person meant it.`);
+  lines.push(risky.length ? `  Do not commit the ${risky.length} file(s) marked as secrets; leave them and tell the person.` : '  No file to commit looks like a secret.');
+  return lines.join('\n');
 }
 
 /** What saving a folder would do, without doing it. */
@@ -1088,10 +1172,74 @@ async function recordSaved(records, options = {}) {
 // file per project per run), then git removes the folder. Never: the main checkout, the folder this runs in, a
 // locked worktree, one used within the idle limit, or one whose save could not be proven.
 // ---------------------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------------------
+// Repair: what a removal that stopped halfway leaves (seen 2026-11-19 in four worktrees). Each step restores git's
+// own state or committed content; none touches work:
+//   link     the folder's .git file is gone, so git calls the worktree "prunable": git worktree repair rewrites it.
+//   lock     an empty index.lock older than STALE_LOCK_MS, while no git process runs: the crashed run's lock.
+//   ignore   tracked .gitignore files deleted from disk: put back from the folder's own commit, so ignored folders
+//            (node_modules) are ignored again. Without them a save tries to keep every dependency and fails.
+// ---------------------------------------------------------------------------------------------------------------
+export const STALE_LOCK_MS = 10 * 60_000;
+
+/** True when a git process runs on this machine; null when that cannot be told (then no lock is ever removed). */
+function gitRunning(options = {}) {
+  if (options.gitRunning !== undefined) return options.gitRunning;
+  try {
+    if ((options.os ?? platform()) === 'win32')
+      return /git\.exe/i.test(execFileSync('tasklist', ['/FI', 'IMAGENAME eq git.exe', '/NH'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }));
+    return execFileSync('ps', ['-A', '-o', 'comm='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split(/\r?\n/).some((c) => basename(c.trim()) === 'git');
+  } catch { return null; }
+}
+
+/** What repair would do (yes: false) or did (yes: true) for one worktree folder. `common` is its repository. */
+export async function repairFolder(path, options = {}) {
+  const actions = [];
+  const top = resolve(path);
+  if (!await lstat(top)) return { path: top, actions, note: 'folder is gone' };
+  // 1. The link.
+  if (!await lstat(join(top, '.git'))) {
+    if (!options.common) return { path: top, actions, note: 'its .git link is gone and its repository is unknown' };
+    actions.push('restore the .git link (git worktree repair)');
+    if (options.yes) {
+      git(['worktree', 'repair', top], options.common);
+      if (!await lstat(join(top, '.git'))) throw new Error('git worktree repair could not restore the .git link');
+    } else return { path: top, actions };
+  }
+  // 2. A stale lock.
+  const gitDir = git(['rev-parse', '--absolute-git-dir'], top);
+  const lock = gitDir ? join(gitDir, 'index.lock') : null;
+  const stat = lock ? await lstat(lock) : null;
+  if (stat && stat.size === 0 && (options.now ?? Date.now()) - stat.mtimeMs > STALE_LOCK_MS) {
+    const running = gitRunning(options);
+    if (running === false) { actions.push(`remove a stale empty git lock from ${new Date(stat.mtimeMs).toISOString()}`); if (options.yes) await fs.rm(lock, { force: true }); }
+    else actions.push(`not removing the git lock from ${new Date(stat.mtimeMs).toISOString()}: ${running ? 'a git process is running' : 'cannot tell whether git is running'}`);
+  }
+  // 3. Deleted ignore files, from the folder's own commit. Only deleted ones: nothing on disk is overwritten.
+  const deleted = (git(['ls-files', '-d', '-z'], top, undefined, true) ?? '').split(String.fromCharCode(0)).filter((rel) => rel && basename(rel) === '.gitignore');
+  const locked = lock && await lstat(lock) && !actions.some((a) => a.startsWith('remove a stale'));
+  if (deleted.length && locked) actions.push(`not putting back ${deleted.length} deleted .gitignore file(s) while the git lock remains`);
+  else if (deleted.length) {
+    actions.push(`put back ${deleted.length} deleted .gitignore file(s) from the commit`);
+    if (options.yes) {
+      const list = join(gitDir, `codein-tidy-repair-${process.pid}-${randomUUID()}`);
+      try {
+        await fs.writeFile(list, deleted.join(String.fromCharCode(0)));
+        if (git(['--literal-pathspecs', 'checkout', `--pathspec-from-file=${list}`, '--pathspec-file-nul', '--'], top) === null) throw new Error('git could not put back the .gitignore files');
+      } finally { await fs.rm(list, { force: true }).catch(() => {}); }
+    }
+  }
+  return { path: top, actions };
+}
+
 export async function closePlan(options = {}) {
   const now = options.now ?? Date.now(), idleDays = options.idleDays ?? 1;
   const here = resolve(options.cwd ?? process.cwd());
   const projects = await unfinishedWork({ ...options, cwd: here });
+  // A folder handed to an agent to commit (codein-tidy record, or the guided hand-off): that commit made it
+  // "used today", which must not keep it.
+  const handoff = await readHandoff(options);
+  const only = options.only ? new Set(options.only.map((p) => resolve(p).toLowerCase())) : null;
   const plan = [];
   for (const p of projects) {
     const common = resolve(p.main, git(['rev-parse', '--git-common-dir'], p.main));
@@ -1099,13 +1247,21 @@ export async function closePlan(options = {}) {
       .filter((l) => l.some((x) => x.startsWith('locked'))).map((l) => resolve(l[0].slice(9))));
     for (const f of p.folders) {
       if (f.main) continue;
+      if (only && !only.has(resolve(f.path).toLowerCase())) continue;
+      const recent = f.idleDays < idleDays && !(handoff[f.path] && f.stage !== 'uncommitted');
+      // Uncommitted work is never closed by a plain close or the scheduled guard, not even saved first: it is
+      // committed first (by the person or an agent). Only an explicit choice (includeUncommitted) closes it.
       const why = inside(f.path, here) ? 'you are working in it' : locked.has(f.path) ? 'locked in git' : f.stage === 'unreadable' ? 'git cannot read it'
-        : f.idleDays < idleDays ? `used ${f.idleDays === 0 ? 'today' : `${f.idleDays} day(s) ago`}` : null;
+        : f.stage === 'uncommitted' && !options.includeUncommitted ? `holds ${f.changed} uncommitted file(s): commit them first (an agent can: run codein-tidy and hand it over)`
+        : recent ? `used ${f.idleDays === 0 ? 'today' : `${f.idleDays} day(s) ago`}` : null;
       plan.push({ project: p.name, common, path: f.path, branch: f.branch, stage: f.stage, madeBy: f.madeBy, idleDays: f.idleDays,
-        changed: f.changed, unpushed: f.unpushed, touched: f.touched, sample: f.sample ?? [], keep: why ?? null });
+        changed: f.changed, missingFiles: f.missingFiles ?? 0, unpushed: f.unpushed, touched: f.touched, sample: f.sample ?? [], keep: why ?? null,
+        // Chosen knowingly: the save is its only copy. closeFolders refuses any other folder that turns out to hold work.
+        allowWork: f.stage === 'uncommitted' && Boolean(options.includeUncommitted) });
     }
   }
-  const candidates = [...plan.filter((x) => !x.keep), ...await closeLeftovers(options)];
+  const leftovers = (await closeLeftovers(options)).filter((x) => !only || only.has(resolve(x.path).toLowerCase()));
+  const candidates = [...plan.filter((x) => !x.keep), ...leftovers];
   await pool(candidates, 4, async (x) => { const m = await measure(x.path); x.bytes = m.bytes; x.freeable = m.freeable; });
   return { idleDays, folders: plan, candidates, freeable: candidates.reduce((s, x) => s + (x.freeable ?? 0), 0), at: now };
 }
@@ -1140,7 +1296,7 @@ async function closeLeftovers(options = {}) {
 }
 
 export async function closeFolders(plan, options = {}) {
-  const receipt = { closed: [], failed: [], saved: [], bundles: [], freed: 0 };
+  const receipt = { closed: [], failed: [], saved: [], bundles: [], freed: 0, repaired: [] };
   const byProject = new Map(), projectNames = new Map();
   let done = 0;
   for (const x of plan.candidates) {
@@ -1152,6 +1308,15 @@ export async function closeFolders(plan, options = {}) {
         receipt.closed.push(x); receipt.freed += x.freeable ?? 0;
         continue;
       }
+      // What a removal that stopped halfway left: repaired first, so git can read the folder and a save is possible.
+      const repair = await repairFolder(x.path, { ...options, common: x.common, yes: true });
+      if (repair.actions.length) receipt.repaired.push(repair);
+      // Look again now: a folder whose link was broken, or that changed since the plan, may hold real work.
+      const raw = gitStatus(['--porcelain=v1', '-z', '--untracked-files=normal'], x.path);
+      if (raw === null) throw new Error('git cannot read it');
+      const now = sortStatus(raw);
+      if (now.work.length && !x.allowWork)
+        throw new Error(`holds ${now.work.length} uncommitted file(s) (${now.work.slice(0, 3).map((l) => l.slice(3)).join(', ')}): commit them first`);
       const saved = await saveFolder(x.path, { ...options, deferIndex: true });
       if (!saved.saved && !/nothing here/.test(saved.reason)) throw new Error(`not saved: ${saved.reason}`);
       if (saved.saved) { receipt.saved.push(saved); if (!byProject.has(x.common)) byProject.set(x.common, []); byProject.get(x.common).push(saved); if (x.project) projectNames.set(x.common, x.project); }
@@ -1739,7 +1904,8 @@ export async function guidedPlan(options = {}) {
     : await scan({ ...options, cwd, history: true, caches: true, worktrees: false, ...(scope.kind === 'drives' ? { drives: scope.drives } : {}) });
   const items = [], notes = [], kept = [];
   options.onStatus?.({ label: 'Checking worktrees and their work', done: 0, total: 0 });
-  const close = await closePlan({ ...options, cwd, all: scope.kind !== 'project', now });
+  // includeUncommitted: such folders are shown here as "not ready", for an agent to commit or the person to choose.
+  const close = await closePlan({ ...options, cwd, all: scope.kind !== 'project', now, includeUncommitted: true });
   const handoff = await readHandoff(options);
   const ready = [], waiting = [];
   for (const x of [...close.folders, ...close.candidates.filter((c) => c.leftover)]) {
@@ -1830,7 +1996,13 @@ export async function recheckWork(plan) {
     const flags = [];
     if (item.identity?.email && author && author !== item.identity.email) flags.push(`committed as ${author}, this folder's identity is ${item.identity.email}`);
     if (pushed) flags.push('the commit was also pushed');
-    item.notReady = false; item.selected = true; item.committed = true; x.stage = 'committed';
+    // Only the added lines of the agent's new commits; a match is shown and the folder is left unselected.
+    const range = x.headAt ? [`${x.headAt}..HEAD`] : ['-1', 'HEAD'];
+    const patch = (await gitAsync(['log', '-p', '--no-color', '-U0', '--format=', ...range], x.path)) ?? '';
+    const added = patch.split(/\r?\n/).filter((l) => l.startsWith('+') && !l.startsWith('+++')).join('\n');
+    const secrets = findSecrets(added);
+    if (secrets.length) flags.push(`the new commit has ${secrets.length} line(s) that look like secrets (${[...new Set(secrets.map((s) => s.what))].join(', ')}): check it before anything is pushed`);
+    item.notReady = false; item.selected = !secrets.length; item.committed = true; x.stage = 'committed';
     item.warn = flags.join('; ') || null;
     item.label = `${folderName(x)} (${x.project}): work committed${item.warn ? ` (${item.warn})` : ''}, ready: save, then remove`;
   }
@@ -1849,8 +2021,11 @@ export function agentBrief(plan, { rerun, only } = {}) {
     '',
     'For each folder below:',
     '1. Work inside that folder. Read the work first: git status, git diff, and every new file.',
+    `   Then run: ${TOOL} check --project=<folder>. It separates real work from scratch (logs, captured streams,`,
+    '   archives, probe scripts: never commit those, they are kept in the save) and flags files that look like secrets.',
+    '   Tracked files missing from disk are not work (they are still in the commit): never commit their deletion.',
     '2. If it has no branch, create one: git switch -c tidy/<short-name>.',
-    '3. Commit the real work with a message that says what the work is (git add the files, then git commit).',
+    '3. Commit the real work with a message that says what the work is: git add only those files by name, then git commit.',
     '   Commit as the git identity that folder already has (shown below). Different projects use different accounts:',
     '   never change git config, never pass --author, never push. If a folder has no identity, leave it and say so.',
     '4. Never run git reset, git checkout -- ., git stash or git clean, and never delete files to make a folder clean.',
@@ -1883,7 +2058,9 @@ export function formatGuided(plan) {
 export async function applyItems(plan, chosen, options = {}, say = () => {}, progress = null) {
   const receipt = { freed: 0, saved: 0, bundles: [], failed: [], moved: 0, trash: undefined };
   const onStep = progress ? (step) => progress.set(step) : undefined;
-  const close = chosen.filter((i) => i.kind === 'close').flatMap((i) => i.close);
+  // A not-ready folder the person chose anyway is closed knowingly (its save is the only copy of its work);
+  // every other folder is refused at close time if it turns out to hold uncommitted work.
+  const close = chosen.filter((i) => i.kind === 'close').flatMap((i) => i.close.map((x) => ({ ...x, allowWork: Boolean(i.notReady) })));
   if (close.length) {
     const label = 'Saving work, then removing folders';
     if (progress) progress.set({ label, done: 0, total: close.length, note: '' });
@@ -2460,7 +2637,27 @@ export async function main(argv, host = {}) {
     if (args.has('--json')) console.log(JSON.stringify(receipt));
     return;
   }
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'hook', 'rules', 'deps', 'guard', 'record'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'hook', 'rules', 'deps', 'guard', 'record', 'check', 'repair'];
+  if (command === 'check') {
+    try {
+      const r = await checkFolder(options.project ?? process.cwd());
+      console.log(args.has('--json') ? JSON.stringify(r, null, 2) : formatCheck(r));
+      if (r.work.some((w) => w.secrets.length)) process.exitCode = 3;
+    } catch (error) { console.error(String(error.message ?? error)); process.exitCode = 1; }
+    return;
+  }
+  if (command === 'repair') {
+    // A worktree a removal left half done. --project names the folder; its repository is found from git's list.
+    const path = resolve(options.project ?? process.cwd());
+    try {
+      const plan = await closePlan({ ...options, cwd: process.cwd(), idleDays: 0, includeUncommitted: true, only: [path] });
+      const known = plan.folders[0];
+      const r = await repairFolder(path, { common: known?.common ?? resolve(path, git(['rev-parse', '--git-common-dir'], path) ?? '.git'), yes: args.has('--yes') });
+      if (!r.actions.length) console.log(`${r.path}: nothing to repair${r.note ? ` (${r.note})` : ''}.`);
+      else console.log(`${r.path}:\n${r.actions.map((a) => `  ${args.has('--yes') ? 'done' : 'would'}: ${a}`).join('\n')}${args.has('--yes') ? '' : '\nThis was a plan. Run again with --yes to repair. Work is never touched.'}`);
+    } catch (error) { console.error(String(error.message ?? error)); process.exitCode = 1; }
+    return;
+  }
   if (command === 'guard') {
     const mode = value('mode') ?? 'notify';
     if (!['notify', 'close'].includes(mode)) { console.error('--mode must be notify or close'); process.exitCode = 2; return; }
@@ -2552,7 +2749,7 @@ export async function main(argv, host = {}) {
   }
   if (!COMMANDS.includes(command) || (older && !(options.olderThanDays >= 1)) || (['prepare', 'save'].includes(command) && !options.project)
       || (command === 'restore' && !positional[1])) {
-    console.error('Usage: codein-tidy [report | work [--all] [--notice] | save --project=PATH [--yes] | saved | restore ID [--to=PATH] | review | prepare --project=PATH [--yes] | clean [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');
+    console.error('Usage: codein-tidy [report | work [--all] [--notice] | save --project=PATH [--yes] | saved | restore ID [--to=PATH] | review | prepare --project=PATH [--yes] | clean [--yes] | close [--only=PATH,PATH] [--include-uncommitted] [--yes] | check --project=PATH | repair --project=PATH [--yes]] [--deep] [--caches] [--project[=PATH]] [--history] [--worktrees] [--older-than=DAYS]');
     process.exitCode = 2; return;
   }
   if (command === 'save') {
@@ -2577,7 +2774,9 @@ export async function main(argv, host = {}) {
     const idle = argv.find((a) => a.startsWith('--idle-days='));
     const idleDays = idle ? Number(idle.split('=')[1]) : 1;
     if (!(idleDays >= 0)) { console.error('--idle-days must be a number of days'); process.exitCode = 2; return; }
-    const plan = await closePlan({ ...options, idleDays, all: args.has('--all') });
+    const onlyArg = value('only');
+    const plan = await closePlan({ ...options, idleDays, all: args.has('--all'), includeUncommitted: args.has('--include-uncommitted'),
+      ...(onlyArg ? { only: onlyArg.split(',').map((p) => p.trim()).filter(Boolean) } : {}) });
     if (!args.has('--yes')) {
       console.log(args.has('--json') ? JSON.stringify(plan, null, 2) : formatClose(plan));
       if (!args.has('--json') && plan.candidates.length) console.log('\nThis was a plan. Nothing was saved or removed. Run again with --yes to save the work and close them.');
@@ -2588,6 +2787,7 @@ export async function main(argv, host = {}) {
     console.log(`Closed ${receipt.closed.length} worktree(s), about ${size(receipt.freed)} freed. Saved work from ${receipt.saved.length} of them.`);
     for (const b of receipt.bundles) console.log(`  Saved work file: ${b}`);
     if (receipt.saved.length) console.log('  List saved work: codein-tidy saved. Put one back: codein-tidy restore <id>.');
+    for (const r of receipt.repaired) console.log(`  repaired ${r.path}: ${r.actions.join('; ')}`);
     for (const f of receipt.failed) console.log(`  kept ${f.path}: ${f.error}`);
     return;
   }

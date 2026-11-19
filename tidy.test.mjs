@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer, parseScope, recheckWork, formatForAgent, recordReview, hookWorktreeCreate, hookWorktreeRemove, hookSessionEnd } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer, parseScope, recheckWork, formatForAgent, recordReview, hookWorktreeCreate, hookWorktreeRemove, hookSessionEnd, repairFolder, checkFolder, formatCheck, findSecrets } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -621,7 +621,12 @@ test('close: idle worktrees are saved into one file and freed; recent, locked an
   const { utimes } = await import('node:fs/promises');
   await writeFile(join(wt('recent'), 'touch.txt'), 'x'); await utimes(join(wt('recent'), 'touch.txt'), new Date(later), new Date(later));
 
-  const plan = await closePlan({ ...m.options, cwd: wt('here'), now: later });
+  // A plain close never takes uncommitted work, not even saved first: it is committed first.
+  const plain = await closePlan({ ...m.options, cwd: wt('here'), now: later });
+  assert.deepEqual(plain.candidates.map((x) => basename(x.path)).sort(), ['done', 'env']);
+  assert.match(plain.folders.find((x) => basename(x.path) === 'dirty').keep, /holds 1 uncommitted file\(s\): commit them first/);
+  // Chosen knowingly, it is saved and closed.
+  const plan = await closePlan({ ...m.options, cwd: wt('here'), now: later, includeUncommitted: true });
   assert.deepEqual(plan.candidates.map((x) => basename(x.path)).sort(), ['dirty', 'done', 'env']);
   const keep = Object.fromEntries(plan.folders.filter((x) => x.keep).map((x) => [basename(x.path), x.keep]));
   assert.deepEqual(keep, { locked: 'locked in git', recent: 'used today', here: 'you are working in it' });
@@ -769,6 +774,126 @@ test('Claude Code hooks: removing a worktree made before the pool saves its work
   assert.deepEqual(await hookWorktreeRemove({ worktree_path: old }, { ...m.options, home: m.home }), { path: old, removed: true, note: 'already gone' });
 });
 
+/** A worktree as a removal that stopped halfway leaves it (seen 2026-11-19): tracked files and .gitignore gone,
+ * dependencies still there, an empty stale lock, and optionally the .git link file gone too. */
+async function halfRemoved(m, g, repo, name, { brokenLink = true } = {}) {
+  const { rm, utimes } = await import('node:fs/promises');
+  const tree = join(m.root, 'wt', name);
+  g(['worktree', 'add', '-q', '-b', name, tree], repo);
+  for (const f of ['b.txt', 'c.txt']) await writeFile(join(tree, f), f);
+  g(['add', '.'], tree); g(['commit', '-q', '-m', `${name} files`], tree); g(['push', '-q', '-u', 'origin', name], tree);
+  for (const f of ['a.txt', 'b.txt', '.gitignore']) await rm(join(tree, f));
+  await aged(join(tree, 'node_modules', 'dep', 'index.js'), 0, 'dependency');
+  const gitDir = g(['rev-parse', '--absolute-git-dir'], tree);
+  await writeFile(join(gitDir, 'index.lock'), '');
+  const old = new Date(Date.now() - 2 * DAY); await utimes(join(gitDir, 'index.lock'), old, old);
+  if (brokenLink) await rm(join(tree, '.git'));
+  return tree;
+}
+
+test('half-removed worktree: found though git calls it prunable, repaired, saved and closed; its branch stays', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), 'node_modules/\n'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const tree = await halfRemoved(m, g, repo, 'half');
+  const later = Date.now() + 3 * DAY;
+  const [p] = await unfinishedWork({ cwd: repo, now: later });
+  const row = p.folders.find((f) => f.path === tree);
+  assert.equal(row?.stage, 'broken link', 'not dropped as prunable: its files are still there');
+
+  // Nothing is changed by a plan.
+  assert.deepEqual((await repairFolder(tree, { common: join(repo, '.git') })).actions, ['restore the .git link (git worktree repair)']);
+  assert.equal(await exists(join(tree, '.git')), false);
+
+  const plan = await closePlan({ ...m.options, cwd: repo, now: later });
+  assert.deepEqual(plan.candidates.map((x) => x.path), [tree]);
+  const receipt = await closeFolders(plan, { home: m.home, gitRunning: false });
+  assert.deepEqual(receipt.failed, []);
+  assert.deepEqual(receipt.repaired[0].actions.map((a) => a.split(' from ')[0]),
+    ['restore the .git link (git worktree repair)', 'remove a stale empty git lock', 'put back 1 deleted .gitignore file(s)']);
+  assert.equal(await exists(tree), false);
+  assert.equal(g(['rev-parse', '--verify', 'half'], repo).length, 40, 'the branch and its commit stay');
+  assert.equal(receipt.saved.length, 1, 'what was left (the missing files) is recorded by the save');
+});
+
+test('half-removed worktree with real work in it: repaired, then refused, nothing removed', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), 'node_modules/\n'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const tree = await halfRemoved(m, g, repo, 'busy');
+  await writeFile(join(tree, 'c.txt'), 'changed by someone');
+  const plan = await closePlan({ ...m.options, cwd: repo, now: Date.now() + 3 * DAY });
+  const receipt = await closeFolders(plan, { home: m.home, gitRunning: false });
+  assert.equal(receipt.closed.length, 0);
+  assert.match(receipt.failed[0].error, /holds 1 uncommitted file\(s\) \(c\.txt\): commit them first/);
+  assert.equal(await (await import('node:fs/promises')).readFile(join(tree, 'c.txt'), 'utf8'), 'changed by someone');
+});
+
+test('repair never removes a lock while git runs, or when that cannot be told', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.gitignore'), 'node_modules/\n'); g(['add', '.'], repo); g(['commit', '-q', '-m', 'ignore'], repo); g(['push', '-q', 'origin', 'main'], repo);
+  const tree = await halfRemoved(m, g, repo, 'locked', { brokenLink: false });
+  for (const gitRunning of [true, null]) {
+    const r = await repairFolder(tree, { common: join(repo, '.git'), yes: true, gitRunning });
+    assert.match(r.actions[0], /^not removing the git lock/);
+    assert.equal(await exists(join(g(['rev-parse', '--absolute-git-dir'], tree), 'index.lock')), true);
+  }
+});
+
+test('missing tracked files are not work; scratch is never work; secrets are flagged before a commit', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const tree = join(m.root, 'wt', 'mixed');
+  g(['worktree', 'add', '-q', '-b', 'mixed', tree], repo);
+  await (await import('node:fs/promises')).rm(join(tree, 'a.txt'));
+  for (const f of ['.vm-submit-api-f22a6e11b.sh', 'coupon-tests.log', '.understory-runtime-fix.sse', 'codein-src.tar', 'build.log.err'])
+    await writeFile(join(tree, f), 'scratch');
+  await writeFile(join(tree, '.pre-commit-config.yaml'), 'repos: []');
+  await writeFile(join(tree, 'adapter.py'), 'print("real work")');
+  await writeFile(join(tree, 'config.js'), `export const token = "ghp_${'a1B2'.repeat(9)}";`);
+  const r = await checkFolder(tree);
+  assert.deepEqual(r.work.map((w) => w.rel).sort(), ['.pre-commit-config.yaml', 'adapter.py', 'config.js']);
+  assert.deepEqual(r.scratch.sort(), ['.understory-runtime-fix.sse', '.vm-submit-api-f22a6e11b.sh', 'build.log.err', 'codein-src.tar', 'coupon-tests.log']);
+  assert.equal(r.missing, 1);
+  assert.deepEqual(r.work.find((w) => w.rel === 'config.js').secrets, [{ line: 1, what: 'GitHub token' }]);
+  assert.match(formatCheck(r), /Do not commit the 1 file\(s\) marked as secrets/);
+  const [p] = await unfinishedWork({ cwd: repo });
+  const row = p.folders.find((f) => f.path === tree);
+  assert.deepEqual([row.changed, row.missingFiles], [3, 1], 'the deletion is counted apart, scratch not at all');
+  assert.deepEqual(findSecrets('plain text\nkey = AKIAABCDEFGHIJKLMNOP\n-----BEGIN RSA PRIVATE KEY-----'), [{ line: 2, what: 'AWS access key' }, { line: 3, what: 'private key' }]);
+  assert.deepEqual(findSecrets('const x = 1; // sk-short'), []);
+});
+
+test('an agent that commits and records a folder hands it back: the fresh commit does not keep it; secrets in that commit are flagged', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const tree = join(m.root, 'wt', 'handed');
+  g(['worktree', 'add', '-q', '-b', 'handed', tree], repo);
+  const headAt = g(['rev-parse', 'HEAD'], tree);
+  await writeFile(join(tree, 'work.js'), `const key = "AKIAABCDEFGHIJKLMNOP";`);
+  g(['add', 'work.js'], tree); g(['commit', '-q', '-m', 'work'], tree);
+  const opts = { ...m.options, cwd: repo, home: m.home };
+  assert.equal((await closePlan(opts)).folders.find((x) => x.path === tree).keep, 'used today');
+  await recordReview(tree, { summary: 'a test change', relevant: 'none' }, { home: m.home });
+  assert.deepEqual((await closePlan(opts)).candidates.map((x) => x.path), [tree], 'recorded: ready despite the fresh commit');
+  // The guided recheck reads the new commit's added lines.
+  const item = { notReady: true, changed: 1, identity: { email: 't@example.com' }, close: [{ path: tree, headAt, project: 'app', branch: 'handed' }] };
+  await recheckWork({ items: [item] });
+  assert.equal(item.selected, false, 'not selected while the commit looks like it holds a secret');
+  assert.match(item.warn, /1 line\(s\) that look like secrets \(AWS access key\)/);
+});
+
+test('close --only takes exactly the folders named', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const a = join(m.root, 'wt', 'a'), b = join(m.root, 'wt', 'b');
+  g(['worktree', 'add', '-q', '--detach', a, 'main'], repo); g(['worktree', 'add', '-q', '--detach', b, 'main'], repo);
+  const plan = await closePlan({ ...m.options, cwd: repo, now: Date.now() + 3 * DAY, only: [b.toUpperCase()] });
+  assert.deepEqual(plan.candidates.map((x) => x.path), [b]);
+  assert.deepEqual(plan.folders.map((x) => x.path), [b]);
+});
+
 test('guard: git worktree add is refused at the budget, allowed under it; other commands always pass', async () => {
   const m = await machine();
   const { g, repo } = await project(m);
@@ -853,11 +978,11 @@ test('guard close mode brings a project back inside its budget unattended, oldes
   const notify = await guardRun({ ...m.options, home: m.home, mode: 'notify' });
   assert.deepEqual(notify.projects.map((p) => [p.linked, p.budget, p.over, p.closed]), [[3, 1, 2, 0]]);
   assert.equal(await exists(oldest), true, 'notify changes nothing');
+  // Unattended, the guard closes only folders without uncommitted work; the two holding work stay, over budget.
   const run = await guardRun({ ...m.options, home: m.home, mode: 'close', now: Date.now() + 2 * DAY });
-  assert.deepEqual(run.projects.map((p) => [p.linked, p.over, p.closed]), [[1, 0, 2]]);
-  assert.deepEqual([await exists(oldest), await exists(middle), await exists(newest)], [false, false, true]);
-  const saved = await savedList({ home: m.home });
-  assert.ok(saved.some((r) => r.path === oldest), 'the oldest folder held work: it was saved before it was closed');
+  assert.deepEqual(run.projects.map((p) => [p.linked, p.over, p.closed]), [[2, 1, 1]]);
+  assert.deepEqual([await exists(oldest), await exists(middle), await exists(newest)], [true, false, true]);
+  assert.equal(await (await import('node:fs/promises')).readFile(join(oldest, 'work.js'), 'utf8'), 'oldest', 'uncommitted work is never closed unattended');
   const { readFile } = await import('node:fs/promises');
   assert.equal(JSON.parse(await readFile(join(m.home, '.codein-tidy', 'guard.json'), 'utf8')).mode, 'close');
 });
@@ -913,7 +1038,7 @@ test('close finishes a folder git dropped but could not delete (Windows: path to
     return tree;
   };
   const a = await make('a');
-  const plan = await closePlan({ ...m.options, cwd: repo, now: Date.now() + 3 * DAY });
+  const plan = await closePlan({ ...m.options, cwd: repo, now: Date.now() + 3 * DAY, includeUncommitted: true });
   const receipt = await closeFolders(plan, { home: m.home });
   assert.deepEqual(receipt.failed, []);
   assert.equal(await exists(a), false, 'finished after git stopped at the long path');
