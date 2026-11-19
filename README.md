@@ -106,7 +106,12 @@ commands keep a project's disk use tied to how many agents work on it at once, n
 | `rules [--write]` | The instructions block for `AGENTS.md` (read by Claude Code, Codex, Cursor, OpenCode and Antigravity). |
 
 **Enforcement.** The Claude Code plugin refuses `git worktree add` when the project is at its budget and points
-the agent to `slot take`. For Codex, add a `PreToolUse` hook running `npx -y codein-tidy@latest guard-shell`;
+the agent to `slot take`. The check only starts for commands that contain `worktree add`, so other commands run
+at full speed. Claude Code's own worktrees (`claude --worktree`, subagents with `isolation: worktree`, workflows,
+background sessions) also come from the pool: its `WorktreeCreate` hook takes a slot, `WorktreeRemove` saves the
+work and gives the folder back, and when a session ends its slots go back to the pool. A slot left in use with no
+change for a day is reused, so a crashed session cannot hold it. Over budget, Claude Code says why and creates
+nothing. For Codex, add a `PreToolUse` hook running `npx -y codein-tidy@latest guard-shell`;
 for Cursor, a `beforeShellExecution` hook running `npx -y codein-tidy@latest guard-shell --cursor` (both not
 yet tested here). Folders a tool creates inside itself are reached by the guard and by the tool's own limit.
 

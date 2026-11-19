@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, utimes, readdir, access } from 'node:fs/prom
 import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer, parseScope, recheckWork, formatForAgent, recordReview } from './tidy.mjs';
+import { scan, clean, formatReport, reviewList, unfinishedWork, formatWork, formatNotice, savePlan, saveFolder, savedList, restoreSaved, closePlan, closeFolders, formatClose, takeSlot, releaseSlot, listSlots, guardShell, writeRules, RULES_BLOCK, depsReport, formatDeps, guardRun, guardSchedule, guardInstall, guidedPlan, guidedRun, formatGuided, readAnswer, parseScope, recheckWork, formatForAgent, recordReview, hookWorktreeCreate, hookWorktreeRemove, hookSessionEnd } from './tidy.mjs';
 
 const DAY = 24 * 60 * 60_000;
 const exists = (path) => access(path).then(() => true, () => false);
@@ -701,6 +701,72 @@ test('slots: a budget of working folders, reused across tasks; work left in a sl
   assert.deepEqual([back.restored, back.branch], [true, 'task-a']);
   const [listed] = await listSlots({ home: m.home });
   assert.deepEqual(listed.slots.map((s) => [s.branch, s.state, s.holder]), [['task-c', 'in use', 'claude'], ['task-b', 'in use', 'codex']]);
+});
+
+test('Claude Code hooks: its own worktrees come from the pool, go back to it with work saved, and a session end frees what it held', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  await writeFile(join(repo, '.codein-tidy.json'), JSON.stringify({ budget: 2 }));
+  await writeFile(join(repo, '.git', 'info', 'exclude'), '.codein-tidy.json\n');
+  const opts = { ...m.options, cwd: repo, home: m.home };
+  const event = (session, extra = {}) => ({ session_id: session, cwd: repo, hook_event_name: 'WorktreeCreate', ...extra });
+
+  // Two sessions each start a worktree: two slots, on Claude Code's own branch names, from the remote's default branch.
+  g(['commit', '-q', '--allow-empty', '-m', 'local only'], repo);
+  const a = await hookWorktreeCreate(event('s1', { name: 'bold-oak-a3f2' }), opts);
+  const b = await hookWorktreeCreate(event('s2', { name: 'calm-fox' }), opts);
+  assert.deepEqual([a.created, a.branch, b.branch], [true, 'worktree-bold-oak-a3f2', 'worktree-calm-fox']);
+  assert.equal(g(['rev-parse', 'HEAD'], a.path), g(['rev-parse', 'origin/main'], repo), 'based on origin/HEAD, not the local commit');
+  await assert.rejects(hookWorktreeCreate(event('s3', { name: 'third' }), opts), (e) => e.code === 'OVER_BUDGET');
+
+  // Session 1 removes its worktree with unfinished work: the work is saved, the folder stays as an idle slot.
+  await writeFile(join(a.path, 'half.js'), 'half done');
+  const removed = await hookWorktreeRemove({ session_id: 's1', worktree_path: a.path }, opts);
+  assert.ok(removed.released && removed.savedId);
+
+  // Session 3 now gets session 1's folder, clean; session 2 ends and its slot is free for the next one.
+  const c = await hookWorktreeCreate(event('s3', { name: 'third' }), opts);
+  assert.deepEqual([c.reused, c.path, await exists(join(c.path, 'half.js'))], [true, a.path, false]);
+  await writeFile(join(b.path, 'wip.js'), 'not committed');
+  assert.deepEqual(await hookSessionEnd({ session_id: 's2', cwd: repo }, opts), { released: 1 });
+  const d = await hookWorktreeCreate(event('s4', { name: 'fourth' }), opts);
+  assert.equal(d.path, b.path);
+  assert.ok(d.savedFirst, 'work session 2 left behind is saved before the folder is reused');
+  assert.equal(g(['worktree', 'list'], repo).split('\n').length, 3, 'two slots plus the main checkout, after four sessions');
+  const back = await restoreSaved(removed.savedId, { home: m.home, to: join(m.root, 'restored') });
+  assert.equal(back.restored, true, 'the unfinished work session 1 left comes back');
+});
+
+test('Claude Code hooks: a session end releases only its own slots, and a slot abandoned for a day is reused', async () => {
+  const m = await machine();
+  const { repo } = await project(m);
+  await writeFile(join(repo, '.codein-tidy.json'), JSON.stringify({ budget: 1 }));
+  await writeFile(join(repo, '.git', 'info', 'exclude'), '.codein-tidy.json\n');
+  const opts = { ...m.options, cwd: repo, home: m.home };
+  const a = await hookWorktreeCreate({ session_id: 'crashed', cwd: repo, name: 'a' }, opts);
+  assert.deepEqual(await hookSessionEnd({ session_id: 'someone-else' }, opts), { released: 0 });
+  assert.deepEqual(await hookSessionEnd({}, opts), { released: 0 }, 'no session id: nothing is released');
+  await assert.rejects(hookWorktreeCreate({ session_id: 'next', cwd: repo, name: 'b' }, opts), (e) => e.code === 'OVER_BUDGET');
+  // Two days later, nothing in the slot changed: the crashed session no longer holds it.
+  const later = Date.now() + 2 * DAY;
+  const b = await hookWorktreeCreate({ session_id: 'next', cwd: repo, name: 'b' }, { ...opts, now: later });
+  assert.deepEqual([b.reused, b.path], [true, a.path]);
+});
+
+test('Claude Code hooks: removing a worktree made before the pool saves its work and local files, then removes it', async () => {
+  const m = await machine();
+  const { g, repo } = await project(m);
+  const old = join(m.root, 'old-wt');
+  g(['worktree', 'add', '-q', '-b', 'old', old], repo);
+  await writeFile(join(old, 'wip.js'), 'unsaved'); await writeFile(join(old, '.env.local'), 'SECRET=1');
+  await writeFile(join(repo, '.git', 'info', 'exclude'), '.env.local\n');
+  const r = await hookWorktreeRemove({ worktree_path: old }, { ...m.options, cwd: repo, home: m.home });
+  assert.equal(r.removed, true);
+  assert.equal(await exists(old), false);
+  const back = await restoreSaved(r.savedId, { home: m.home, to: join(m.root, 'back') });
+  assert.equal(back.restored, true);
+  assert.equal(await exists(join(m.root, 'back', '.env.local')), true, 'the ignored local file came back too');
+  assert.deepEqual(await hookWorktreeRemove({ worktree_path: old }, { ...m.options, home: m.home }), { path: old, removed: true, note: 'already gone' });
 });
 
 test('guard: git worktree add is refused at the budget, allowed under it; other commands always pass', async () => {

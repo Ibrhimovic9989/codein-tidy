@@ -18,8 +18,41 @@
         "hooks": [
           {
             "type": "command",
+            "if": "Bash(*worktree add*)",
             "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tidy.mjs\" guard-shell",
             "timeout": 15
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tidy.mjs\" hook worktree-create",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tidy.mjs\" hook worktree-remove",
+            "timeout": 300
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/tidy.mjs\" hook session-end"
           }
         ]
       }

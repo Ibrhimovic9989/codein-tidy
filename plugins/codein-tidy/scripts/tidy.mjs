@@ -1314,6 +1314,7 @@ export async function takeSlot(options) {
   return withRegistry(options, async (registry) => {
     const entry = (registry.projects[p.common] ??= { main: p.main, slots: [] });
     entry.slots = entry.slots.filter((s) => p.linked.some((w) => w.path === s.path)); // forget slots git no longer lists
+    await reclaimStale(entry, options.now ?? Date.now());
     if (busy) {
       const mine = entry.slots.find((s) => s.path === busy.path);
       if (mine && mine.state === 'idle') { Object.assign(mine, { state: 'in use', holder, since: new Date().toISOString() }); return { path: busy.path, branch, reused: true, created: false }; }
@@ -1364,6 +1365,78 @@ export async function releaseSlot(options) {
     if (saved && !saved.saved) throw new Error(`could not save the work in ${top}: ${saved.reason}`);
     Object.assign(slot, { state: 'idle', holder: null, since: new Date().toISOString() });
     return { path: top, savedId: saved?.id ?? null };
+  });
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Claude Code's own worktrees (claude --worktree, EnterWorktree, subagents with isolation: worktree, workflows,
+// background sessions) never pass through the shell hook. Its WorktreeCreate hook replaces git's creation (the
+// last line printed is the worktree's path), WorktreeRemove replaces git's removal (exit 0 = removed), and
+// SessionEnd runs when a session closes. These three route Claude Code through the slot pool:
+// create = take a slot, remove = save the work and give the folder back, session end = give back what the session
+// held. Giving back never deletes work: a slot's leftover work is saved before the slot is reused or closed.
+// ---------------------------------------------------------------------------------------------------------------
+/** A slot "in use" whose holder left no change for this long may be reused: a crashed session cannot hold it. */
+export const STALE_SLOT_DAYS = 1;
+
+const holderOf = (input) => (input?.session_id ? `claude-code:${input.session_id}` : 'claude-code');
+
+/** When a slot was last changed: its files (3 levels) and its git index, whichever is newer. */
+async function slotTouched(path) {
+  const gitDir = git(['rev-parse', '--path-format=absolute', '--git-dir'], path);
+  const index = gitDir ? (await lstat(join(gitDir, 'index')))?.mtimeMs ?? 0 : 0;
+  return Math.max(await newest(path, 3), index);
+}
+
+/** Slots held "in use" with no change for STALE_SLOT_DAYS become idle. Returns how many were reclaimed. */
+async function reclaimStale(entry, now) {
+  let reclaimed = 0;
+  for (const slot of entry.slots) {
+    if (slot.state !== 'in use') continue;
+    const since = Date.parse(slot.since ?? '') || 0;
+    if (now - since < STALE_SLOT_DAYS * DAY || now - await slotTouched(slot.path) < STALE_SLOT_DAYS * DAY) continue;
+    Object.assign(slot, { state: 'idle', holder: null, since: new Date(now).toISOString(), reclaimedFrom: slot.holder ?? null });
+    reclaimed += 1;
+  }
+  return reclaimed;
+}
+
+export async function hookWorktreeCreate(input, options = {}) {
+  const cwd = resolve(input?.cwd ?? options.cwd ?? process.cwd());
+  const p = projectOf(cwd);
+  const name = String(input?.name ?? '').replace(/[^\w.-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '') || `task-${Date.now().toString(36)}`;
+  // Same base as Claude Code's own creation: the remote's default branch when there is one, else this checkout's HEAD.
+  const base = git(['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/HEAD^{commit}'], p.main) ?? git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}'], cwd) ?? undefined;
+  return takeSlot({ ...options, cwd, project: cwd, branch: `worktree-${name}`, base, holder: holderOf(input) });
+}
+
+export async function hookWorktreeRemove(input, options = {}) {
+  const path = resolve(input?.worktree_path ?? '');
+  if (!input?.worktree_path || !await lstat(path)) return { path, removed: true, note: 'already gone' };
+  const p = projectOf(path);
+  const isSlot = (await listSlots(options)).some((e) => e.common === p.common && e.slots.some((s) => s.path === path));
+  if (isSlot) {
+    const r = await releaseSlot({ ...options, path });
+    return { path, removed: false, released: true, savedId: r.savedId };
+  }
+  // A worktree made before the pool existed: save its work, then remove it as git would have.
+  const plan = await savePlan(path, options);
+  const saved = plan.changed || plan.unreferenced || plan.keep.length ? await saveFolder(path, options) : null;
+  if (saved && !saved.saved) throw new Error(`not removed: its work could not be saved (${saved.reason})`);
+  git(['worktree', 'remove', '--force', path], p.main);
+  if (await lstat(path)) throw new Error(`git could not remove ${path}`);
+  return { path, removed: true, savedId: saved?.id ?? null };
+}
+
+export async function hookSessionEnd(input, options = {}) {
+  const holder = holderOf(input);
+  if (holder === 'claude-code') return { released: 0 }; // no session id: nothing provably this session's
+  return withRegistry(options, async (registry) => {
+    let released = 0;
+    for (const entry of Object.values(registry.projects))
+      for (const slot of entry.slots)
+        if (slot.state === 'in use' && slot.holder === holder) { Object.assign(slot, { state: 'idle', holder: null, since: new Date().toISOString() }); released += 1; }
+    return { released };
   });
 }
 
@@ -2387,7 +2460,7 @@ export async function main(argv, host = {}) {
     if (args.has('--json')) console.log(JSON.stringify(receipt));
     return;
   }
-  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'rules', 'deps', 'guard', 'record'];
+  const COMMANDS = ['report', 'clean', 'review', 'prepare', 'work', 'save', 'saved', 'restore', 'close', 'slot', 'guard-shell', 'hook', 'rules', 'deps', 'guard', 'record'];
   if (command === 'guard') {
     const mode = value('mode') ?? 'notify';
     if (!['notify', 'close'].includes(mode)) { console.error('--mode must be notify or close'); process.exitCode = 2; return; }
@@ -2429,6 +2502,29 @@ export async function main(argv, host = {}) {
         else console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }));
       }
     } catch {}
+    return;
+  }
+  if (command === 'hook') {
+    // Claude Code's WorktreeCreate / WorktreeRemove / SessionEnd hooks, with the event as JSON on stdin.
+    const event = positional[1];
+    let input = {};
+    try { let raw = ''; for await (const chunk of process.stdin) raw += chunk; input = raw.trim() ? JSON.parse(raw) : {}; } catch {}
+    try {
+      if (event === 'worktree-create') {
+        const r = await hookWorktreeCreate(input, options);
+        console.error(`codein-tidy: ${r.created ? 'new slot' : 'reused slot'} ${r.path} on branch ${r.branch}${r.savedFirst ? `; work left in it was saved first (${r.savedFirst})` : ''}.`);
+        console.log(r.path); // the last line on stdout is the worktree Claude Code uses
+      } else if (event === 'worktree-remove') {
+        const r = await hookWorktreeRemove(input, options);
+        console.error(r.released ? `codein-tidy: ${r.path} went back to the pool${r.savedId ? `; its work was saved (${r.savedId})` : ''}.`
+          : `codein-tidy: removed ${r.path}${r.savedId ? `; its work was saved first (${r.savedId})` : ''}.`);
+      } else if (event === 'session-end') {
+        await hookSessionEnd(input, options);
+      } else { console.error('Usage: codein-tidy hook worktree-create | worktree-remove | session-end  (event JSON on stdin)'); process.exitCode = 2; }
+    } catch (error) {
+      // A session end must never fail; a worktree create or remove that cannot be done safely must say why.
+      if (event !== 'session-end') { console.error(`codein-tidy: ${String(error.message ?? error)}`); process.exitCode = 1; }
+    }
     return;
   }
   if (command === 'rules') {
